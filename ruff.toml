@@ -1,0 +1,4 @@
+[lint]
+# Dead-code maintenance: pyflakes (F) + unused noqa directives.
+# Deliberately minimal - the codebase is not style-formatted.
+select = ["F", "RUF100"]
