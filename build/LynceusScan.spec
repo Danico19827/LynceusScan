@@ -33,9 +33,21 @@ with open(_version_file, "w", encoding="utf-8") as _vf:
 
 # rasterio resolves Cython submodules and GDAL/PROJ data dynamically at
 # runtime (invisible to static analysis); collect them explicitly.
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_submodules,
+)
 
 hiddenimports += collect_submodules("rasterio")
+
+# pyogrio is geopandas' default file engine and ships compiled extensions
+# plus its own GDAL/PROJ data. Static analysis misses pyogrio._geometry
+# (loaded while importing the package) and the data folders, so frozen
+# runs failed with "to_file requires pyogrio". collect_all brings the
+# submodules, the .pyd files and gdal_data/proj_data.
+pyogrio_datas, pyogrio_binaries, pyogrio_hidden = collect_all("pyogrio")
+hiddenimports += pyogrio_hidden
 
 datas = [
     ("lynceus/ui/styles/app.qss", "lynceus/ui/styles"),
@@ -50,6 +62,7 @@ datas = [
 ]
 datas += collect_data_files("rasterio", subdir="gdal_data")
 datas += collect_data_files("rasterio", subdir="proj_data")
+datas += pyogrio_datas
 # NOTE: locale packs are NOT bundled: English is the base language and
 # locales arrive as downloaded extensions (.lxpkg). Only theme packs ship.
 if os.path.isdir(os.path.join(ROOT, "extensions", "themes")):
@@ -58,7 +71,7 @@ if os.path.isdir(os.path.join(ROOT, "extensions", "themes")):
 a = Analysis(
     [os.path.join(ROOT, "main.py")],
     pathex=[ROOT],
-    binaries=[],
+    binaries=pyogrio_binaries,
     datas=[(os.path.join(ROOT, src), dst) for src, dst in datas],
     hiddenimports=hiddenimports,
     hookspath=[],

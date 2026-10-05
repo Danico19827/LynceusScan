@@ -1,4 +1,4 @@
-# LynceusScan — beta pública (0.1.0b1)
+# LynceusScan — beta pública (0.1.0b2)
 
 > **English version:** [README.md](README.md)
 
