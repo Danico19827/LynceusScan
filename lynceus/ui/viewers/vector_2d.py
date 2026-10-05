@@ -2,15 +2,20 @@
 # Copyright (c) 2026 Taritolay, Nicolás Daniel <lynceusscan@gmail.com>
 """2D viewer for vector products such as polygon GeoPackages.
 
-Reads a layer with geopandas and renders it as RGBA. Numeric metrics use an
-RdYlGn choropleth, metric selector, and legend; NODATA is gray. A sidecar
-``.meta.json`` controls the metric list and order through ``metrics_computed``.
-Without metadata, generic bookkeeping columns are excluded. Registered for
-``vector`` and ``grid_metrics`` products.
+Reads a layer with the PROJ-free vector reader (sqlite3 + shapely) and
+renders it as RGBA. Numeric metrics use an RdYlGn choropleth, metric
+selector, and legend; NODATA is gray. A sidecar ``.meta.json`` controls
+the metric list and order through ``metrics_computed``. Without metadata,
+generic bookkeeping columns are excluded. Registered for ``vector`` and
+``grid_metrics`` products. The reader deliberately avoids
+geopandas/pyproj/pyogrio: the GUI process already loads rasterio's PROJ
+build, and mixing both stacks in one process crashes natively.
 """
 
 import json
 from pathlib import Path
+
+import numpy as np
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QPolygonF
@@ -27,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from lynceus.plugins.locale import t
 from lynceus.processing.qml_style import BOOKKEEPING_COLS
+from lynceus.processing.vector_table import read_vector_features
 from lynceus.ui.branding import THEME_COLORS
 from lynceus.ui.viewers.base import BaseViewer
 from lynceus.ui.viewers.palette import metric_colors
@@ -48,10 +54,16 @@ def short_crs_label(crs) -> str:
 
     A raw WKT runs to thousands of characters and blows the preview
     window past the screen; the short label keeps the product
-    identifiable without layout damage.
+    identifiable without layout damage. The vector reader resolves the
+    label from the GeoPackage metadata (no PROJ), so a plain string is
+    the normal input; CRS-like objects stay accepted for API
+    compatibility.
     """
-    if crs is None:
+    if crs is None or crs == "":
         return "—"
+    if isinstance(crs, str):
+        text = crs
+        return text if len(text) <= CRS_LABEL_LEN else text[:CRS_LABEL_LEN] + "…"
     try:
         epsg = crs.to_epsg()
     except Exception:
@@ -145,6 +157,19 @@ def _ramp_color(t: float):
     return (float(rgb[0]), float(rgb[1]), float(rgb[2]))
 
 
+def _as_float(values: np.ndarray) -> np.ndarray:
+    """Numeric view of a column, NODATA/NaN for uncoercible values."""
+    if values.dtype.kind in "fiu":
+        return values.astype(np.float64)
+    out = np.empty(len(values), dtype=np.float64)
+    for index, value in enumerate(values):
+        try:
+            out[index] = float(value)
+        except (TypeError, ValueError):
+            out[index] = np.nan
+    return out
+
+
 class Vector2DViewer(BaseViewer):
     """2D view of polygonal geometries from a GeoPackage.
 
@@ -154,7 +179,7 @@ class Vector2DViewer(BaseViewer):
 
     def __init__(self, kind: str, parent=None):
         super().__init__(kind, parent)
-        self._gdf = None
+        self._features = None
         self._fields: list[str] = []
         self._default_metric: str | None = None
         self._meta_bk: set = set()
@@ -226,46 +251,35 @@ class Vector2DViewer(BaseViewer):
         def load(cancelled):
             if cancelled.is_set():
                 return None
-            import geopandas as gpd
-
             meta = self._read_meta(path_str)
             metric_order = (
                 [str(metric) for metric in meta.get("metrics_computed", ())]
                 if "metrics_computed" in meta
                 else None
             )
-            columns = None
-            if metric_order:
-                try:
-                    import pyogrio
-
-                    available = set(pyogrio.read_info(path_str)["fields"])
-                    selected = [field for field in metric_order if field in available]
-                    if selected:
-                        columns = selected
-                except Exception:
-                    columns = None
-            gdf = gpd.read_file(path_str, columns=columns)
+            features = read_vector_features(
+                path_str, fields=metric_order, with_geometry=True
+            )
             if cancelled.is_set():
                 return None
-            if len(gdf) == 0:
+            if len(features) == 0:
                 return {"empty": True}
 
             bookkeeping = {
                 str(column) for column in (meta.get("bookkeeping_cols") or ())
             }
-            fields = self._numeric_fields(gdf, metric_order, bookkeeping)
+            fields = self._numeric_fields(features, metric_order, bookkeeping)
             default_metric = meta.get("default_metric")
             field = (
                 default_metric
                 if default_metric in fields
                 else fields[0] if fields else None
             )
-            image = self._render_field(gdf, field, borders=borders)
+            image = self._render_field(features, field, borders=borders)
             if image is None and field is not None:
                 field = None
-                image = self._render_field(gdf, None, borders=borders)
-            return gdf, meta, metric_order, bookkeeping, fields, field, image
+                image = self._render_field(features, None, borders=borders)
+            return features, meta, metric_order, bookkeeping, fields, field, image
 
         def loaded(result) -> None:
             if result is None:
@@ -273,8 +287,8 @@ class Vector2DViewer(BaseViewer):
             if isinstance(result, dict) and result.get("empty"):
                 self._show_placeholder(t("Layer has no features"))
                 return
-            gdf, meta, metric_order, bookkeeping, fields, field, image = result
-            self._gdf = gdf
+            features, meta, metric_order, bookkeeping, fields, field, image = result
+            self._features = features
             self._img_cache = {}
             self._metric_order = metric_order
             self._meta_bk = bookkeeping
@@ -309,7 +323,7 @@ class Vector2DViewer(BaseViewer):
         self.start_async_load(load, loaded, failed)
 
     def _show_placeholder(self, text: str) -> None:
-        self._gdf = None
+        self._features = None
         self._fields = []
         self._metric_order = None
         self._img_cache = {}
@@ -339,18 +353,14 @@ class Vector2DViewer(BaseViewer):
 
     @staticmethod
     def _numeric_fields(
-        gdf, allowed: list[str] | None = None, bk: set | None = None
+        features, allowed: list[str] | None = None, bk: set | None = None
     ) -> list[str]:
-        import pandas as pd
-
         if allowed is not None:
-            return [c for c in allowed if c in gdf.columns]
+            return [c for c in allowed if c in features.columns]
         excluded = set(BOOKKEEPING_COLS) | set(bk or ())
         return [
-            c for c in gdf.columns
-            if c != "geometry"
-            and c not in excluded
-            and pd.api.types.is_numeric_dtype(gdf[c])
+            c for c in features.fields
+            if c not in excluded and c in features.numeric
         ]
 
     def _default_field(self) -> str:
@@ -365,7 +375,7 @@ class Vector2DViewer(BaseViewer):
         self._refresh()
 
     def _refresh(self) -> None:
-        if self._gdf is None or not self._fields:
+        if self._features is None or not self._fields:
             return
         field = self._metric_combo.currentData() or self._fields[0]
         key = (field, self._borders_check.isChecked())
@@ -375,21 +385,21 @@ class Vector2DViewer(BaseViewer):
             self._apply_field_image(image, field)
             return
 
-        gdf = self._gdf
+        features = self._features
         borders = self._borders_check.isChecked()
 
         def load(cancelled):
             if cancelled.is_set():
                 return None
             image = self._render_field(
-                gdf, field, borders=borders, cancelled=cancelled
+                features, field, borders=borders, cancelled=cancelled
             )
             if cancelled.is_set():
                 return None
             uniform = image is None
             if uniform:
                 image = self._render_field(
-                    gdf, None, borders=borders, cancelled=cancelled
+                    features, None, borders=borders, cancelled=cancelled
                 )
             return image, uniform
 
@@ -427,7 +437,7 @@ class Vector2DViewer(BaseViewer):
             self._legend_row.hide()
             self._info.setText(
                 t("{n} features | CRS {crs} | {field}: all values NODATA").format(
-                    n=len(self._gdf), crs=short_crs_label(self._gdf.crs),
+                    n=len(self._features), crs=short_crs_label(self._features.crs_label),
                     field=field,
                 )
             )
@@ -437,15 +447,15 @@ class Vector2DViewer(BaseViewer):
         self._legend_row.show()
         self._info.setText(
             t("{n} features | CRS {crs} | {field}: {m} valid cells").format(
-                n=len(self._gdf),
-                crs=short_crs_label(self._gdf.crs),
+                n=len(self._features),
+                crs=short_crs_label(self._features.crs_label),
                 field=field,
                 m=f"{n_valid:,}",
             )
         )
 
     def _render_uniform(self) -> None:
-        if self._gdf is None:
+        if self._features is None:
             return
         key = (None, self._borders_check.isChecked())
         image = self._img_cache.get(key)
@@ -454,14 +464,14 @@ class Vector2DViewer(BaseViewer):
             self._apply_uniform_image(image)
             return
 
-        gdf = self._gdf
+        features = self._features
         borders = self._borders_check.isChecked()
 
         def load(cancelled):
             if cancelled.is_set():
                 return None
             return self._render_field(
-                gdf, None, borders=borders, cancelled=cancelled
+                features, None, borders=borders, cancelled=cancelled
             )
 
         def loaded(image) -> None:
@@ -488,11 +498,11 @@ class Vector2DViewer(BaseViewer):
         self._legend_row.hide()
         self._info.show()
         self.setWindowTitle(self._compose_title())
-        cols = [c for c in self._gdf.columns if c != "geometry"]
+        cols = list(self._features.fields)
         self._info.setText(
             t("{n} features | CRS {crs} | attrs: {cols}").format(
-                n=len(self._gdf),
-                crs=short_crs_label(self._gdf.crs),
+                n=len(self._features),
+                crs=short_crs_label(self._features.crs_label),
                 cols=", ".join(cols[:8]),
             )
         )
@@ -504,9 +514,9 @@ class Vector2DViewer(BaseViewer):
 
     @staticmethod
     def _render_field(
-        gdf, field: str | None, borders: bool = False, cancelled=None
+        features, field: str | None, borders: bool = False, cancelled=None
     ):
-        """GeoDataFrame of polygons -> QImage over a dark background.
+        """VectorFeatures of polygons -> QImage over a dark background.
 
         With a numeric field it paints a choropleth (2-98% stretch, NODATA in
         gray / uniform if there is no valid data). Without a field it uses the
@@ -516,10 +526,11 @@ class Vector2DViewer(BaseViewer):
         (n_valid=0 if the field is all NODATA or there is no field) or None
         if there are no polygons.
         """
-        import numpy as np
         from shapely.geometry import MultiPolygon, Polygon
 
-        minx, miny, maxx, maxy = gdf.total_bounds
+        if features.bounds is None or features.geometries is None:
+            return None
+        minx, miny, maxx, maxy = features.bounds
         if not all(np.isfinite([minx, miny, maxx, maxy])):
             return None
         if cancelled is not None and cancelled.is_set():
@@ -535,10 +546,8 @@ class Vector2DViewer(BaseViewer):
 
         field_data = None
         nodata_mask = None
-        if field is not None:
-            import pandas as pd
-
-            vals = pd.to_numeric(gdf[field], errors="coerce").to_numpy(dtype=float)
+        if field is not None and field in features.columns:
+            vals = _as_float(features.columns[field])
             nodata_mask = ~np.isfinite(vals) | (vals == VECTOR_NODATA)
             valid = vals[~nodata_mask]
             if valid.size >= 2:
@@ -553,8 +562,8 @@ class Vector2DViewer(BaseViewer):
 
         fast = (
             Vector2DViewer._try_raster_cells(
-                gdf, field_data, nodata_mask, minx, maxy, scale, w_px, h_px,
-                cancelled,
+                features, field_data, nodata_mask, minx, maxy, scale,
+                w_px, h_px, cancelled,
             )
             if not borders
             else None
@@ -601,7 +610,7 @@ class Vector2DViewer(BaseViewer):
             return True
 
         n_drawn = 0
-        for i, geom in enumerate(gdf.geometry):
+        for i, geom in enumerate(features.geometries):
             if (
                 cancelled is not None
                 and i % RENDER_CANCEL_CHECK_INTERVAL == 0
@@ -649,26 +658,29 @@ class Vector2DViewer(BaseViewer):
 
     @staticmethod
     def _try_raster_cells(
-        gdf, field_data, nodata_mask, minx, maxy, scale, w_px, h_px,
+        features, field_data, nodata_mask, minx, maxy, scale, w_px, h_px,
         cancelled=None,
     ):
         """Numpy rasterization for dense axis-aligned box grids."""
-        import numpy as np
         import shapely
 
+        geometries = features.geometries
+        if geometries is None or features.feature_count == 0:
+            return None
         try:
-            kind = gdf.geom_type.to_numpy()
-            bounds = gdf.bounds
-            bw = (bounds["maxx"] - bounds["minx"]).to_numpy()
-            bh = (bounds["maxy"] - bounds["miny"]).to_numpy()
-            geometries = gdf.geometry.array
+            kind = shapely.get_type_id(geometries)
+            box = shapely.bounds(geometries)
+            bw = box[:, 2] - box[:, 0]
+            bh = box[:, 3] - box[:, 1]
             area = shapely.area(geometries)
             perim = shapely.length(geometries)
         except Exception:
             return None
         if cancelled is not None and cancelled.is_set():
             return None
-        if kind.size == 0 or not bool((kind == "Polygon").all()):
+        if kind.size == 0 or not bool(
+            (kind == shapely.GeometryType.POLYGON).all()
+        ):
             return None
         if not bool(
             np.isclose(area, bw * bh, rtol=1e-9).all()
@@ -679,18 +691,18 @@ class Vector2DViewer(BaseViewer):
             rgb = (metric_colors(field_data[0]) * 255).astype(np.uint8)
             nod = np.asarray(nodata_mask, dtype=bool)
             gray = np.array(NODATA_FILL.getRgb()[:3], dtype=np.uint8)
-            colors = np.empty((len(gdf), 3), dtype=np.uint8)
+            colors = np.empty((features.feature_count, 3), dtype=np.uint8)
             colors[nod] = gray
             colors[~nod] = rgb[~nod]
             stats = (float(field_data[1]), float(field_data[2]), field_data[3])
         else:
             fill = np.array(FILL.getRgb()[:3], dtype=np.uint8)
-            colors = np.tile(fill, (len(gdf), 1))
+            colors = np.tile(fill, (features.feature_count, 1))
             stats = (0.0, 0.0, 0)
-        x0 = np.floor((bounds["minx"].to_numpy() - minx) * scale).astype(int)
-        x1 = np.ceil((bounds["maxx"].to_numpy() - minx) * scale).astype(int)
-        y0 = np.floor((maxy - bounds["maxy"].to_numpy()) * scale).astype(int)
-        y1 = np.ceil((maxy - bounds["miny"].to_numpy()) * scale).astype(int)
+        x0 = np.floor((box[:, 0] - minx) * scale).astype(int)
+        x1 = np.ceil((box[:, 2] - minx) * scale).astype(int)
+        y0 = np.floor((maxy - box[:, 3]) * scale).astype(int)
+        y1 = np.ceil((maxy - box[:, 1]) * scale).astype(int)
         x1 = np.maximum(x1, x0 + 1)
         y1 = np.maximum(y1, y0 + 1)
         np.clip(x0, 0, w_px, out=x0)
@@ -702,7 +714,7 @@ class Vector2DViewer(BaseViewer):
         )
         pixels = np.empty((h_px, w_px, 3), dtype=np.uint8)
         pixels[:, :] = background
-        for i in range(len(gdf)):
+        for i in range(features.feature_count):
             if (
                 cancelled is not None
                 and i % RENDER_CANCEL_CHECK_INTERVAL == 0

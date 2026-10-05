@@ -42,7 +42,9 @@ DEFAULT_RAMP = "generic"
 BOOKKEEPING_COLS = {"gid", "fid", "ogc_fid"}
 
 _RASTER_EXT = {".tif", ".tiff"}
-_VECTOR_EXT = {".gpkg", ".shp", ".geojson"}
+# No SHP: reading it would pull geopandas/pyogrio (a second PROJ build)
+# into the GUI process, which crashes natively next to rasterio's PROJ.
+_VECTOR_EXT = {".gpkg", ".geojson"}
 
 RAMPS: dict[str, dict] = {
     "dtm": {
@@ -609,20 +611,26 @@ def generate_qml(
 # ---------------------------------------------------------------------------
 
 def _read_vector_table(path: Path):
-    """Read a complete GeoPackage/SHP table with geopandas."""
-    import geopandas as gpd
+    """Read a complete GeoPackage/GeoJSON attribute table without PROJ."""
+    from lynceus.processing.vector_table import read_vector_features
 
-    return gpd.read_file(str(path))
+    return read_vector_features(path, with_geometry=False)
 
 
-def _column_stats(gdf, field: str) -> Optional[tuple[float, float, int]]:
+def _column_stats(features, field: str) -> Optional[tuple[float, float, int]]:
     """Return finite column min/max/count excluding NODATA."""
     import numpy as np
 
-    try:
-        vals = gdf[field].astype(float).to_numpy()
-    except (KeyError, TypeError, ValueError):
+    values = features.columns.get(field)
+    if values is None:
         return None
+    try:
+        vals = values.astype(float)
+    except (TypeError, ValueError):
+        try:
+            vals = np.array([float(v) for v in values], dtype=float)
+        except (TypeError, ValueError):
+            return None
     valid = vals[np.isfinite(vals) & (vals != VECTOR_NODATA)]
     if valid.size == 0:
         return None
@@ -644,7 +652,7 @@ def _meta_sidecar(path: Path) -> dict:
 
 
 def _default_vector_field(
-    gdf,
+    features,
     planned: Optional[list] = None,
     bk_cols: Optional[list] = None,
 ) -> Optional[str]:
@@ -653,13 +661,10 @@ def _default_vector_field(
     Prefer node-declared metrics, exclude bookkeeping columns and geometry,
     then fall back to the first remaining numeric column.
     """
-    import pandas as pd
-
     excluded = set(BOOKKEEPING_COLS) | set(bk_cols or ())
     numeric_cols = [
-        c for c in gdf.columns
-        if c != "geometry" and c not in excluded
-        and pd.api.types.is_numeric_dtype(gdf[c])
+        c for c in features.fields
+        if c not in excluded and c in features.numeric
     ]
     if planned:
         for c in planned:
@@ -668,9 +673,9 @@ def _default_vector_field(
     return numeric_cols[0] if numeric_cols else None
 
 
-def _generic_classes(gdf, field: str):
+def _generic_classes(features, field: str):
     """5 graduated classes from the real range of the column."""
-    stats = _column_stats(gdf, field)
+    stats = _column_stats(features, field)
     if stats is None:
         return None
     vmin, vmax, _ = stats
@@ -758,20 +763,20 @@ def style_vector_file(
 
     if classes is None:
         try:
-            gdf = _read_vector_table(vpath)
+            features = _read_vector_table(vpath)
         except Exception as exc:
             logger.warning(f"Cannot read {vpath.name}: {exc}")
             return False
         if field is None:
             meta = _meta_sidecar(vpath)
             field = _default_vector_field(
-                gdf,
+                features,
                 planned=meta.get("metrics_computed"),
                 bk_cols=meta.get("bookkeeping_cols"),
             )
             if field is None:
                 return False
-        classes = _generic_classes(gdf, field)
+        classes = _generic_classes(features, field)
         if classes is None:
             return False
         style_name = (name or f"{stem} \u2014 {field}") if field else stem

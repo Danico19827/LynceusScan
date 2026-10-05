@@ -132,22 +132,25 @@ def tile_class_noise(tile: dict, ctx: dict) -> dict:
     from scipy.spatial import cKDTree
 
     def mask_fn(record) -> np.ndarray:
-        # float32 coordinates: ~0.03 mm resolution at survey ranges, plenty
-        # for meter-scale neighborhoods, at half the tree bandwidth. Workers
-        # stay single-threaded on purpose (the pool already sizes processes
+        # Rebase to the local centroid before the float32 cast: raw UTM
+        # coordinates in the millions quantize to ~0.5 m in float32, which
+        # collapses real point spacing. The offset keeps sub-millimeter
+        # precision at half the tree bandwidth. Workers stay
+        # single-threaded on purpose (the pool already sizes processes
         # to CPUs; inner threads would oversubscribe).
-        points = np.column_stack(
+        coords = np.column_stack(
             (
-                np.asarray(record.x, dtype=np.float32),
-                np.asarray(record.y, dtype=np.float32),
-                np.asarray(record.z, dtype=np.float32),
+                np.asarray(record.x, dtype=np.float64),
+                np.asarray(record.y, dtype=np.float64),
+                np.asarray(record.z, dtype=np.float64),
             )
         )
-        n = len(points)
+        n = len(coords)
         if n <= 1:
             # Neighborhood statistics are undefined for a lone point;
             # keep it conservatively instead of flagging on self-count.
             return np.ones(n, dtype=bool)
+        points = (coords - coords.mean(axis=0)).astype(np.float32)
         method = ctx.get("method", "sor")
         if method == "sor":
             k = min(int(ctx.get("sor_points", 6)), max(n - 1, 1))
@@ -158,10 +161,17 @@ def tile_class_noise(tile: dict, ctx: dict) -> dict:
             return mean <= threshold
         radius = float(ctx.get("ror_radius_m", 5.0))
         min_k = int(ctx.get("ror_min_points", 3))
-        counts = cKDTree(points, leafsize=32).query_ball_point(
-            points, radius, return_length=True
-        )
-        return counts >= min_k
+        # A point has >= min_k neighbors within the radius iff its
+        # (min_k-1)-th nearest distance (self included at 0) is within
+        # it: an early-exit kNN threshold, equivalent to counting every
+        # neighbor in the radius. Radius counting explodes at modern
+        # densities (~21k neighbors per point at 278 pts/m2 with r=5 m).
+        if min_k <= 1:
+            return np.ones(n, dtype=bool)
+        if min_k > n:
+            return np.zeros(n, dtype=bool)
+        dists = cKDTree(points, leafsize=32).query(points, k=min_k)[0]
+        return dists[:, min_k - 1] <= radius
 
     default_class = (
         NOISE_HIGH_CLASS if ctx.get("method", "sor") == "sor" else NOISE_LOW_CLASS

@@ -2,9 +2,10 @@
 # Copyright (c) 2026 Taritolay, Nicolás Daniel <lynceusscan@gmail.com>
 """Tabular viewer for CSV statistics and GeoPackage attribute tables.
 
-The payload prefers ``stats_csv`` and falls back to ``file``. CSV uses the
-standard library; GeoPackage attributes use geopandas. Registered for
-``table_csv``.
+The payload prefers ``stats_csv`` and falls back to ``file``. CSV and
+GeoPackage attributes both use the standard library (``sqlite3`` for
+GPKG): the GUI process never loads the geopandas/pyproj stack, which
+crashes natively next to rasterio's PROJ. Registered for ``table_csv``.
 """
 
 import csv
@@ -133,17 +134,9 @@ class TableCsvViewer(BaseViewer):
 
     @staticmethod
     def _read_gpkg(path: str, limit: int) -> tuple[list[str], list[list[str]]]:
-        import pyogrio
+        from lynceus.processing.vector_table import read_vector_rows
 
-        frame = pyogrio.read_dataframe(
-            path, max_features=limit, read_geometry=False
-        )
-        headers = [str(column) for column in frame.columns]
-        rows = [
-            ["" if v is None else str(v) for v in rec]
-            for rec in frame.itertuples(index=False, name=None)
-        ]
-        return headers, rows
+        return read_vector_rows(path, limit=limit)
 
 
 register("table_csv", TableCsvViewer)

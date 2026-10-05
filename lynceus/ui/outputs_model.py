@@ -25,7 +25,10 @@ import os
 
 _RASTER_EXT = {".tif", ".tiff"}
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
-_VECTOR_EXT = {".gpkg", ".shp", ".geojson"}
+# No SHP: the viewer reads GPKG/GeoJSON with stdlib+shapely (no PROJ);
+# SHP support would pull the geopandas/pyogrio stack back into the GUI
+# process, which crashes natively next to rasterio's PROJ.
+_VECTOR_EXT = {".gpkg", ".geojson"}
 _TABLE_EXT = {".csv", ".txt"}
 _POINT_CLOUD_EXT = {".las", ".laz"}
 _JSON_EXT = {".json"}
