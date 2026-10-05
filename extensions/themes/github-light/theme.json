@@ -1,0 +1,14 @@
+{
+  "background": "#ffffff",
+  "surface": "#f6f8fa",
+  "border": "#d1d9e0",
+  "border_strong": "#abb4bf",
+  "text": "#1f2328",
+  "text_body": "#454c54",
+  "muted": "#59636e",
+  "accent": "#0969da",
+  "danger": "#d1242f",
+  "amber": "#9a6700",
+  "canvas_bg": "#edf0f3",
+  "wire": "#59636e"
+}

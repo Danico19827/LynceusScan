@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "tokyo-night-light",
+  "version": "1.0.0",
+  "kind": "theme",
+  "display_name": "Tokyo Night Light",
+  "description": "Unofficial port of Tokyo Night Day (folke, MIT).",
+  "author": "Taritolay, Nicolás Daniel",
+  "license": "GPL-3.0-or-later",
+  "payload": {
+    "palette": "theme.json"
+  }
+}

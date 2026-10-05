@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "solarized-light",
+  "version": "1.0.0",
+  "kind": "theme",
+  "display_name": "Solarized Light",
+  "description": "Unofficial port of Solarized light (Ethan Schoonover, MIT).",
+  "author": "Taritolay, Nicolás Daniel",
+  "license": "GPL-3.0-or-later",
+  "payload": {
+    "palette": "theme.json"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "rose-pine",
+  "version": "1.0.0",
+  "kind": "theme",
+  "display_name": "Rose Pine",
+  "description": "Unofficial port of Rosé Pine main (MIT).",
+  "author": "Taritolay, Nicolás Daniel",
+  "license": "GPL-3.0-or-later",
+  "payload": {
+    "palette": "theme.json"
+  }
+}

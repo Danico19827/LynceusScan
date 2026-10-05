@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "one-dark",
+  "version": "1.0.0",
+  "kind": "theme",
+  "display_name": "One Dark",
+  "description": "Unofficial port of the Atom One Dark palette (MIT).",
+  "author": "Taritolay, Nicolás Daniel",
+  "license": "GPL-3.0-or-later",
+  "payload": {
+    "palette": "theme.json"
+  }
+}

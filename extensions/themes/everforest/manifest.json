@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "everforest",
+  "version": "1.0.0",
+  "kind": "theme",
+  "display_name": "Everforest",
+  "description": "Unofficial port of Everforest dark (sainnhe, MIT).",
+  "author": "Taritolay, Nicolás Daniel",
+  "license": "GPL-3.0-or-later",
+  "payload": {
+    "palette": "theme.json"
+  }
+}

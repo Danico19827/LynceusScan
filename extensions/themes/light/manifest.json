@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "light",
+  "version": "1.0.0",
+  "kind": "theme",
+  "display_name": "Light",
+  "description": "Light theme for LynceusScan.",
+  "author": "Taritolay, Nicolás Daniel",
+  "license": "GPL-3.0-or-later",
+  "payload": {
+    "palette": "theme.json"
+  }
+}

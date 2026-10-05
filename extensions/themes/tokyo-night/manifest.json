@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "id": "tokyo-night",
+  "version": "1.0.0",
+  "kind": "theme",
+  "display_name": "Tokyo Night",
+  "description": "Unofficial port of the Tokyo Night palette (folke, MIT).",
+  "author": "Taritolay, Nicolás Daniel",
+  "license": "GPL-3.0-or-later",
+  "payload": {
+    "palette": "theme.json"
+  }
+}
