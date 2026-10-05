@@ -1,0 +1,249 @@
+{
+  "format": "lynceus-project",
+  "version": 2,
+  "saved_at": "2026-10-05T07:14:30+00:00",
+  "nodes": [
+    {
+      "iid": "45794873",
+      "id": "lynceus.nodes.lidar.terrain.classify_ground",
+      "x": -100.0,
+      "y": -120.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "strategy": "pmf"
+        }
+      }
+    },
+    {
+      "iid": "2b2c7799",
+      "id": "lynceus.nodes.lidar.terrain.generate_chm",
+      "x": 500.0,
+      "y": -20.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "52e300af",
+      "id": "lynceus.nodes.lidar.terrain.generate_dtm",
+      "x": 200.0,
+      "y": -180.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "resolution": 0.3,
+          "smooth_sigma": 0.5
+        }
+      }
+    },
+    {
+      "iid": "0930636f",
+      "id": "lynceus.nodes.lidar.terrain.generate_dsm",
+      "x": 200.0,
+      "y": -20.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "resolution": 0.3,
+          "nodata_value": -9999.0
+        }
+      }
+    },
+    {
+      "iid": "5b1a7730",
+      "id": "lynceus.nodes.lidar.source.load_las_laz",
+      "x": -380.0,
+      "y": -120.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "62815aac",
+      "id": "lynceus.nodes.lidar.analysis.canopy_penetration",
+      "x": 200.0,
+      "y": -260.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "hole_fill_max_dist_m": 3.0,
+          "resolution": 0.3
+        }
+      }
+    },
+    {
+      "iid": "253703df",
+      "id": "lynceus.nodes.lidar.analysis.flightline_coverage",
+      "x": 200.0,
+      "y": -340.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "resolution": 0.3
+        }
+      }
+    },
+    {
+      "iid": "d7e3de19",
+      "id": "lynceus.nodes.lidar.analysis.grid_metrics",
+      "x": 200.0,
+      "y": 80.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "5dce8b57",
+      "id": "lynceus.nodes.lidar.analysis.grid_vegetation",
+      "x": 500.0,
+      "y": -120.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "0a8c4f66",
+      "id": "lynceus.nodes.lidar.analysis.intensity_ortho",
+      "x": 200.0,
+      "y": 160.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "resolution": 0.3
+        }
+      }
+    },
+    {
+      "iid": "42599afe",
+      "id": "lynceus.nodes.lidar.source.file_info",
+      "x": -100.0,
+      "y": -200.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "757448ec",
+      "id": "lynceus.nodes.lidar.output.export_point_cloud",
+      "x": 200.0,
+      "y": 240.0,
+      "label": "",
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "0930636f",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "52e300af",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "52e300af",
+      "src_out": 1,
+      "dst": "2b2c7799",
+      "dst_in": 0,
+      "out_type": "dtm_mosaic",
+      "in_type": "dtm_mosaic"
+    },
+    {
+      "src": "0930636f",
+      "src_out": 1,
+      "dst": "2b2c7799",
+      "dst_in": 1,
+      "out_type": "dsm_mosaic",
+      "in_type": "dsm_mosaic"
+    },
+    {
+      "src": "5b1a7730",
+      "src_out": 0,
+      "dst": "45794873",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "62815aac",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "253703df",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "d7e3de19",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "5dce8b57",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "52e300af",
+      "src_out": 1,
+      "dst": "5dce8b57",
+      "dst_in": 1,
+      "out_type": "dtm_mosaic",
+      "in_type": "dtm_mosaic"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "0a8c4f66",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "5b1a7730",
+      "src_out": 0,
+      "dst": "42599afe",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "757448ec",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    }
+  ],
+  "view": {
+    "scale": 0.7815333882934872,
+    "cx": 185.53270042194094,
+    "cy": -14.074894514767934
+  },
+  "name": "Análisis profundo de archivo LiDAR",
+  "template": {
+    "name": "Análisis profundo de archivo LiDAR",
+    "description": "Flujo completo de productos desde un archivo LiDAR (.las/.laz): informe File Info, nube clasificada con PMF exportada a LAZ, DTM/DSM/CHM a 0.3 m, penetración de dosel, cobertura de franjas, métricas de grilla, vegetación por celda y ortofoto de intensidad. Parte de una nube que ya pasó limpieza (o se ve bastante limpia): no hay filtrado de ruido aquí, así que con nubes ruidosas agrega la cadena de limpieza antes del Classify. Elige tu archivo LiDAR en el Load y corre: todos los productos salen listos para QGIS con estilos incluidos.",
+    "author": "Taritolay, Nicolás Daniel",
+    "version": "0.1",
+    "tags": ["lidar", "analisis", "productos", "terreno", "vegetacion"]
+  }
+}

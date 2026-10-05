@@ -1,0 +1,124 @@
+{
+  "format": "lynceus-project",
+  "version": 2,
+  "saved_at": "2026-10-05T08:10:00+00:00",
+  "nodes": [
+    {
+      "iid": "1a2b3c4d",
+      "id": "lynceus.nodes.lidar.source.load_las_laz",
+      "x": -560.0,
+      "y": -120.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "2b3c4d5e",
+      "id": "lynceus.nodes.lidar.clean.elevation_range",
+      "x": -280.0,
+      "y": -120.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "3c4d5e6f",
+      "id": "lynceus.nodes.lidar.clean.class_noise",
+      "x": 0.0,
+      "y": -120.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "method": "sor"
+        }
+      }
+    },
+    {
+      "iid": "4d5e6f70",
+      "id": "lynceus.nodes.lidar.clean.class_noise",
+      "x": 280.0,
+      "y": -120.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "method": "ror",
+          "noise_class": 7
+        }
+      }
+    },
+    {
+      "iid": "5e6f7081",
+      "id": "lynceus.nodes.lidar.clean.filter_classification",
+      "x": 560.0,
+      "y": -120.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "mode": "remove",
+          "classes": "7,18"
+        }
+      }
+    },
+    {
+      "iid": "6f708192",
+      "id": "lynceus.nodes.lidar.output.export_point_cloud",
+      "x": 840.0,
+      "y": -120.0,
+      "label": "",
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "src": "1a2b3c4d",
+      "src_out": 0,
+      "dst": "2b3c4d5e",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "2b3c4d5e",
+      "src_out": 0,
+      "dst": "3c4d5e6f",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "3c4d5e6f",
+      "src_out": 0,
+      "dst": "4d5e6f70",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "4d5e6f70",
+      "src_out": 0,
+      "dst": "5e6f7081",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "5e6f7081",
+      "src_out": 0,
+      "dst": "6f708192",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    }
+  ],
+  "view": {
+    "scale": 0.8,
+    "cx": 140.0,
+    "cy": -120.0
+  },
+  "name": "Limpieza de nube LiDAR",
+  "template": {
+    "name": "Limpieza de nube LiDAR",
+    "description": "Cadena de limpieza no destructiva para un archivo LiDAR (.las/.laz): Elevation Range acota la elevación (por defecto no filtra nada: ajusta los límites a tu zona), el primer Classify Noise etiqueta el ruido alto aislado con SOR (clase 18) y el segundo el ruido bajo disperso con ROR (clase 7); Filter by Classification convierte esas etiquetas en borrado real (solo las clases 7 y 18) y Export escribe la nube limpia a LAZ. El suelo (clase 2) queda protegido en todos los pasos por defecto. Elige tu archivo LiDAR en el Load y corre.",
+    "author": "Taritolay, Nicolás Daniel",
+    "version": "0.1",
+    "tags": ["lidar", "limpieza", "ruido", "calidad"]
+  }
+}

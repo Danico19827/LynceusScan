@@ -1,0 +1,54 @@
+{
+  "format": "lynceus-project",
+  "version": 2,
+  "saved_at": "2026-10-05T08:12:00+00:00",
+  "nodes": [
+    {
+      "iid": "0a1b2c3d",
+      "id": "lynceus.nodes.raster.input_raster",
+      "x": -240.0,
+      "y": -40.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "strategy": "multispectral"
+        }
+      }
+    },
+    {
+      "iid": "1b2c3d4e",
+      "id": "lynceus.nodes.raster.ops.vegetation_index",
+      "x": 120.0,
+      "y": -40.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "index": "ndvi"
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "src": "0a1b2c3d",
+      "src_out": 0,
+      "dst": "1b2c3d4e",
+      "dst_in": 0,
+      "out_type": "raster",
+      "in_type": "raster"
+    }
+  ],
+  "view": {
+    "scale": 1.0,
+    "cx": -60.0,
+    "cy": -40.0
+  },
+  "name": "Índices de vegetación (multiespectral)",
+  "template": {
+    "name": "Índices de vegetación (multiespectral)",
+    "description": "Calcula un índice de vegetación (NDVI por defecto) desde un ortomosaico multiespectral (GeoTIFF de 2 o más bandas): elige el archivo en el Input Raster, verifica el orden de bandas de tu sensor (por defecto rojo = 3 y NIR = 5, el orden común B/G/R/RE/NIR) y corre. El resultado sale en [-1, 1] con NODATA (-9999.0) donde falta información, listo para QGIS con su rampa incluida. Cambia el preset en el nodo para NDRE, GNDVI, SAVI o Custom.",
+    "author": "Taritolay, Nicolás Daniel",
+    "version": "0.1",
+    "tags": ["raster", "vegetacion", "ndvi", "multiespectral"]
+  }
+}

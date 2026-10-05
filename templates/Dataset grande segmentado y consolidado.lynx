@@ -1,0 +1,90 @@
+{
+  "format": "lynceus-project",
+  "version": 2,
+  "saved_at": "2026-10-05T08:16:00+00:00",
+  "nodes": [
+    {
+      "iid": "d4e5f6a7",
+      "id": "lynceus.nodes.lidar.source.load_las_laz",
+      "x": -560.0,
+      "y": -120.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "max_points_per_part": 20000000
+        }
+      }
+    },
+    {
+      "iid": "e5f6a7b8",
+      "id": "lynceus.nodes.lidar.terrain.classify_ground",
+      "x": -240.0,
+      "y": -120.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "strategy": "pmf"
+        }
+      }
+    },
+    {
+      "iid": "f6a7b8c9",
+      "id": "lynceus.nodes.lidar.analysis.grid_metrics",
+      "x": 80.0,
+      "y": -120.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "a7b8c9da",
+      "id": "lynceus.nodes.flow.consolidate",
+      "x": 400.0,
+      "y": -120.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "strategy": "grid_metrics"
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "src": "d4e5f6a7",
+      "src_out": 0,
+      "dst": "e5f6a7b8",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "e5f6a7b8",
+      "src_out": 0,
+      "dst": "f6a7b8c9",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "f6a7b8c9",
+      "src_out": 0,
+      "dst": "a7b8c9da",
+      "dst_in": 0,
+      "out_type": "grid_metrics",
+      "in_type": "grid_metrics"
+    }
+  ],
+  "view": {
+    "scale": 0.9,
+    "cx": -80.0,
+    "cy": -120.0
+  },
+  "name": "Dataset grande segmentado y consolidado",
+  "template": {
+    "name": "Dataset grande segmentado y consolidado",
+    "description": "Flujo para archivos LiDAR (.las/.laz) que no conviene procesar de una sola pasada: el Load está configurado para partir el trabajo en lotes de 20M de puntos (ajústalo a tu RAM) y cada lote genera sus métricas de grilla parciales. El nodo Consolidate (Merge: Grid Metrics) espera a todos los lotes y fusiona las celdas por clave, sin costuras: obtienes una única tabla GeoPackage con métricas por celda, igual que en una corrida sin segmentación. Para mejores resultados parte de una nube limpia (ver la plantilla Limpieza de nube LiDAR). Elige tu archivo LiDAR en el Load y corre.",
+    "author": "Taritolay, Nicolás Daniel",
+    "version": "0.1",
+    "tags": ["lidar", "segmentacion", "dataset-grande", "metricas"]
+  }
+}

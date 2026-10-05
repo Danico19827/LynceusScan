@@ -1,0 +1,70 @@
+{
+  "format": "lynceus-project",
+  "version": 2,
+  "saved_at": "2026-10-05T08:14:00+00:00",
+  "nodes": [
+    {
+      "iid": "a1b2c3d4",
+      "id": "lynceus.nodes.raster.input_raster",
+      "x": -240.0,
+      "y": -160.0,
+      "label": "CHM antes",
+      "config": {
+        "pipeline": {
+          "strategy": "chm"
+        }
+      }
+    },
+    {
+      "iid": "b2c3d4e5",
+      "id": "lynceus.nodes.raster.input_raster",
+      "x": -240.0,
+      "y": 40.0,
+      "label": "CHM después",
+      "config": {
+        "pipeline": {
+          "strategy": "chm"
+        }
+      }
+    },
+    {
+      "iid": "c3d4e5f6",
+      "id": "lynceus.nodes.raster.ops.chm_difference",
+      "x": 160.0,
+      "y": -60.0,
+      "label": "",
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "src": "a1b2c3d4",
+      "src_out": 0,
+      "dst": "c3d4e5f6",
+      "dst_in": 0,
+      "out_type": "chm_mosaic",
+      "in_type": "chm_mosaic"
+    },
+    {
+      "src": "b2c3d4e5",
+      "src_out": 0,
+      "dst": "c3d4e5f6",
+      "dst_in": 1,
+      "out_type": "chm_mosaic",
+      "in_type": "chm_mosaic"
+    }
+  ],
+  "view": {
+    "scale": 1.0,
+    "cx": -40.0,
+    "cy": -60.0
+  },
+  "name": "Cambio de vegetación entre dos CHM",
+  "template": {
+    "name": "Cambio de vegetación entre dos CHM",
+    "description": "Compara dos modelos de altura de dosel (CHM) ya procesados, de dos fechas o dos tratamientos: elige cada archivo en su Input Raster (nodo CHM antes y nodo CHM después) y corre. El nodo CHM Difference resta A − B celda por celda: valores positivos significan dosel más alto en el CHM antes, negativos más alto en el después, y las celdas sin dato en cualquiera de los dos quedan NODATA. Los CHM generados por LynceusScan sirven directo como entrada.",
+    "author": "Taritolay, Nicolás Daniel",
+    "version": "0.1",
+    "tags": ["raster", "chm", "cambio", "monitoreo"]
+  }
+}
