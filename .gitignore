@@ -11,5 +11,5 @@ extensions/cache/
 build/
 dist/
 dist-installer/
-extensions/
 !extensions/themes/
+extensions/
