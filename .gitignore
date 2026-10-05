@@ -12,3 +12,4 @@ build/
 dist/
 dist-installer/
 extensions/
+!extensions/themes/
