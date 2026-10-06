@@ -14,7 +14,7 @@ dynamic surfaces (node library, inspector, canvas items).
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractButton,
     QComboBox,
@@ -36,6 +36,39 @@ class _LanguageBridge(QObject):
 _bridge = _LanguageBridge()
 language_changed = _bridge.changed
 """Bound signal emitted with the new language code; UI must re-render."""
+
+
+ORIG_ITEM_ROLE = Qt.ItemDataRole.UserRole + 100
+"""Item-data role holding a combo entry's English source text.
+
+QComboBox user data lives in UserRole; this separate role pins the
+English source next to it, so the translate pass never has to guess the
+original from the currently displayed (possibly already translated) text.
+"""
+
+
+def set_combo_items(combo: QComboBox, items: list) -> None:
+    """Populate a combo from English ``(text, data)`` sources.
+
+    Stores the English text per index, shows the translated text, preserves
+    the current selection by data and blocks signals while rebuilding so no
+    side effect (device reloads, config writes) fires mid-rebuild.
+    """
+    previous = combo.currentData()
+    combo.blockSignals(True)
+    try:
+        combo.clear()
+        for english, data in items:
+            combo.addItem(t(english), data)
+            combo.setItemData(
+                combo.count() - 1, english, ORIG_ITEM_ROLE
+            )
+        restored = -1
+        if previous is not None:
+            restored = combo.findData(previous)
+        combo.setCurrentIndex(restored if restored >= 0 else 0)
+    finally:
+        combo.blockSignals(False)
 
 
 def _translate_action(action) -> None:
@@ -111,6 +144,10 @@ def _translate_one(widget: QWidget) -> None:
             widget.setTabText(i, t(_orig(widget, prop, tab_text)))
     elif isinstance(widget, QComboBox):
         for i in range(widget.count()):
+            pinned = widget.itemData(i, ORIG_ITEM_ROLE)
+            if isinstance(pinned, str) and pinned:
+                widget.setItemText(i, t(pinned))
+                continue
             item = widget.itemText(i)
             prop = f"origItem{i}_en"
             widget.setItemText(i, t(_orig(widget, prop, item)))

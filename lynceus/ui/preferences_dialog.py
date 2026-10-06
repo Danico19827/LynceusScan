@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, QSize, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from lynceus.plugins.locale import locale_manager, t
 from lynceus.ui.fonts import available_families
+from lynceus.ui.translate import set_combo_items
 from lynceus.ui.theming import available_themes
 from lynceus.processing.acceleration import available_acceleration_devices
 from lynceus.processing.executor import workers_for_percent
@@ -129,27 +130,14 @@ class _GeneralPage(QWidget):
             self,
         ))
         self.theme = QComboBox(self)
-        for tid, label in available_themes():
-            self.theme.addItem(label, tid)
+        self._reload_theme()
         form.addRow(_T("Theme"), self.theme)
         form.addRow(_desc(
             "Color theme. Applies immediately when you press Ok.",
             self,
         ))
         self.font = QComboBox(self)
-        self.font.addItem(t("System default"), "")
-        # Each family renders in itself; pin an explicit size so the style
-        # never resolves a default (-1) size with a setPointSize warning.
-        base_size = self.font.font().pointSize()
-        if base_size <= 0:
-            base_size = 9
-        for family in available_families():
-            self.font.addItem(family, family)
-            item_font = QFont(family)
-            item_font.setPointSize(base_size)
-            self.font.setItemData(
-                self.font.count() - 1, item_font, Qt.ItemDataRole.FontRole
-            )
+        self._reload_fonts()
         form.addRow(_T("Font"), self.font)
         form.addRow(_desc(
             "Interface font. Applies immediately when you press Ok.",
@@ -189,6 +177,35 @@ class _GeneralPage(QWidget):
             self,
         ))
         self.load()
+
+    def _reload_theme(self) -> None:
+        set_combo_items(
+            self.theme,
+            [(label, tid) for tid, label in available_themes()],
+        )
+
+    def _reload_fonts(self) -> None:
+        set_combo_items(
+            self.font,
+            [("System default", "")]
+            + [(family, family) for family in available_families()],
+        )
+        # Each family renders in itself; pin an explicit size so the style
+        # never resolves a default (-1) size with a setPointSize warning.
+        base_size = self.font.font().pointSize()
+        if base_size <= 0:
+            base_size = 9
+        for i in range(1, self.font.count()):
+            item_font = QFont(self.font.itemData(i))
+            item_font.setPointSize(base_size)
+            self.font.setItemData(
+                i, item_font, Qt.ItemDataRole.FontRole
+            )
+
+    def _retranslate_combos(self) -> None:
+        """Rebuild combos from English sources (language switch)."""
+        self._reload_theme()
+        self._reload_fonts()
 
     def load(self) -> None:
         settings = _settings()
@@ -287,14 +304,10 @@ class _PerformancePage(QWidget):
 
         accel_form = QFormLayout()
         self.accel_mode = QComboBox(self)
-        for mode in ACCEL_MODES:
-            self.accel_mode.addItem(t(mode.capitalize()), mode)
+        self._reload_accel_mode()
         accel_form.addRow(_T("Acceleration"), self.accel_mode)
         self.accel_backend = QComboBox(self)
-        for backend in ACCEL_BACKENDS:
-            self.accel_backend.addItem(
-                t("Auto") if backend == "auto" else backend.upper(), backend
-            )
+        self._reload_accel_backend()
         self.accel_backend.currentIndexChanged.connect(self._reload_devices)
         accel_form.addRow(_T("Backend"), self.accel_backend)
         self.accel_device = QComboBox(self)
@@ -345,16 +358,39 @@ class _PerformancePage(QWidget):
             t("{size} ({p}%)").format(size=_gb(budget), p=pct) + floor_note
         )
 
+    def _reload_accel_mode(self) -> None:
+        set_combo_items(
+            self.accel_mode,
+            [(mode.capitalize(), mode) for mode in ACCEL_MODES],
+        )
+
+    def _reload_accel_backend(self) -> None:
+        set_combo_items(
+            self.accel_backend,
+            [
+                ("Auto" if backend == "auto" else backend.upper(), backend)
+                for backend in ACCEL_BACKENDS
+            ],
+        )
+
     def _reload_devices(self) -> None:
         backend = self.accel_backend.currentData() or "auto"
-        self.accel_device.clear()
-        self.accel_device.addItem(t("Auto"), "")
+        items = [("Auto", "")]
         for dev in available_acceleration_devices():
             if backend != "auto" and dev.backend != backend:
                 continue
             if not dev.available:
                 continue
-            self.accel_device.addItem(f"{dev.name} ({dev.backend})", dev.device_id)
+            items.append((f"{dev.name} ({dev.backend})", dev.device_id))
+        set_combo_items(self.accel_device, items)
+
+    def _retranslate_combos(self) -> None:
+        """Rebuild combos from English sources (language switch)."""
+        self._reload_accel_mode()
+        self._reload_accel_backend()
+        self._reload_devices()
+        self._refresh_cpu_label()
+        self._refresh_mem_label()
 
     def load(self) -> None:
         settings = _settings()
@@ -431,8 +467,7 @@ TABLE_ROW_PRESETS = (
 
 def _preset_combo(presets, parent=None) -> QComboBox:
     combo = QComboBox(parent)
-    for label, data in presets:
-        combo.addItem(label, data)
+    set_combo_items(combo, [(label, data) for label, data in presets])
     return combo
 
 
@@ -561,11 +596,11 @@ class _AboutPage(QWidget):
 
         form = QFormLayout(self)
         for label, value in (
-            (t("Version"), app_version),
-            (t("License"), "GPL-3.0-or-later"),
-            (t("Built with"), "Qt for Python (PySide6) \u00b7 LGPL-3.0"),
-            (t("Contact"), "lynceusscan@gmail.com"),
-            (t("Repository"), links.CORE_REPO_URL),
+            (_T("Version"), app_version),
+            (_T("License"), "GPL-3.0-or-later"),
+            (_T("Built with"), "Qt for Python (PySide6) \u00b7 LGPL-3.0"),
+            (_T("Contact"), "lynceusscan@gmail.com"),
+            (_T("Repository"), links.CORE_REPO_URL),
         ):
             field = QLabel(value, self)
             field.setTextInteractionFlags(
@@ -683,7 +718,33 @@ class PreferencesDialog(QDialog):
             item = self.nav.item(row)
             if item is not None:
                 item.setText(t(name_en))
+        for _label, page in self._pages:
+            retranslate = getattr(page, "_retranslate_combos", None)
+            if retranslate is not None:
+                retranslate()
         translate_widget(self)
+        self._settle_geometry()
+
+    def _settle_geometry(self) -> None:
+        """Grow to fit retranslated text without geometry warnings.
+
+        A bare adjustSize() can request the (possibly stale or
+        word-wrap-shrunk) size hint, which the window manager clamps up
+        to the layout minimum with a setGeometry warning. Growing only
+        to the layout minimum can never be clamped, so it never warns.
+        """
+        layout = self.layout()
+        if layout is not None:
+            layout.invalidate()
+        need = self.minimumSizeHint().expandedTo(self.sizeHint())
+        target = need.expandedTo(self.size())
+        cap = self.maximumSize()
+        target = QSize(
+            min(target.width(), cap.width()),
+            min(target.height(), cap.height()),
+        )
+        if target != self.size():
+            self.resize(target)
 
     def _on_accept(self) -> None:
         for _label, page in self._pages:

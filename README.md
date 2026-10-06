@@ -1,4 +1,4 @@
-# LynceusScan — public beta (0.1.0b2)
+# LynceusScan — public beta (0.1.0b3)
 
 > **Versión en español:** [README.es.md](README.es.md)
 
@@ -63,7 +63,7 @@ engine, 2D/3D viewers, project templates, 22 interface themes and the
 extension framework. **Not** included, by design — download them from the
 [extensions repository](https://github.com/Danico19827/LynceusScan-Extensions):
 
-- **Language packs** (Spanish, Russian, Italian, Brazilian Portuguese) —
+- **Language packs** (Spanish, Russian, Italian, Brazilian Portuguese, Simplified Chinese, Hindi, Arabic, French, Bengali) —
   import the `.lxpkg` with File → Extensions → Import extension (or drag &
   drop the file onto the canvas). The new language appears under Tools →
   Preferences → General.

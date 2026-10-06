@@ -9,7 +9,7 @@ authors:
   - family-names: Taritolay
     given-names: Nicolás Daniel
     email: lynceusscan@gmail.com
-version: 0.1.0b2
+version: 0.1.0b3
 repository-code: "https://github.com/Danico19827/LynceusScan"
 license: GPL-3.0-or-later
 abstract: "Node-based GUI for large-scale LiDAR processing: tiled parallel

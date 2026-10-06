@@ -1,4 +1,4 @@
-# LynceusScan — beta pública (0.1.0b2)
+# LynceusScan — beta pública (0.1.0b3)
 
 > **English version:** [README.md](README.md)
 
@@ -68,7 +68,7 @@ interfaz y el framework de extensiones. **No** incluido, por diseño —
 descárgalo del [repositorio de
 extensiones](https://github.com/Danico19827/LynceusScan-Extensions):
 
-- **Packs de idioma** (español, ruso, italiano, portugués brasileño) —
+- **Packs de idioma** (español, ruso, italiano, portugués brasileño, chino simplificado, hindi, árabe, francés, bengalí) —
   importa el `.lxpkg` con Archivo → Extensiones → Importar extensión (o
   arrastra el archivo al lienzo). El idioma nuevo aparece en
   Herramientas → Preferencias → General.

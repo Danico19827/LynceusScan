@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 from lynceus import project as project_io
 from lynceus import templates as templates_io
-from lynceus.plugins.locale import locale_manager, t
+from lynceus.plugins.locale import is_rtl, locale_manager, t
 from lynceus.plugins.registry import manager
 from lynceus.plugins.store import ConsentStore
 from lynceus.resources import resource_path
@@ -158,16 +158,35 @@ class MainWindow(QMainWindow):
 
     # ---------- language ----------
 
+    @staticmethod
+    def _apply_text_direction(code: str) -> None:
+        """Mirror widget layouts for right-to-left languages (Arabic).
+
+        The canvas graph itself stays left-to-right by design (ports and
+        edges are spatial, like any node editor); only widget chrome
+        mirrors. Painted text still shapes correctly per run.
+        """
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.setLayoutDirection(
+            Qt.LayoutDirection.RightToLeft
+            if is_rtl(code)
+            else Qt.LayoutDirection.LeftToRight
+        )
+
     def _setup_language(self) -> None:
         settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
         saved = settings.value("language", "en")
         locale_manager.set_language(saved or "en")
+        self._apply_text_direction(locale_manager.language)
         language_changed.connect(self._on_language_changed)
         translate_widget(self)
 
     def _set_language(self, code: str) -> None:
         locale_manager.set_language(code)
         QSettings(SETTINGS_ORG, SETTINGS_APP).setValue("language", code)
+        self._apply_text_direction(locale_manager.language)
         language_changed.emit(locale_manager.language)
 
     def _on_language_changed(self, _code: str) -> None:

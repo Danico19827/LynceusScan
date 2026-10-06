@@ -30,6 +30,14 @@ from lynceus.plugins.registry import manager
 
 DEFAULT_LANG = "en"
 
+RTL_LANGS = ("ar",)
+"""Language codes read right-to-left (widget layouts mirror for these)."""
+
+
+def is_rtl(code: str | None) -> bool:
+    """Whether `code` needs a right-to-left layout direction."""
+    return (code or "").lower() in RTL_LANGS
+
 
 class LocaleManager:
     """Holds merged catalogs and resolves translations."""
