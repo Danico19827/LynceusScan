@@ -1,0 +1,216 @@
+{
+  "format": "lynceus-project",
+  "version": 2,
+  "saved_at": "2026-10-07T12:00:00+00:00",
+  "nodes": [
+    {
+      "iid": "45794873",
+      "id": "lynceus.nodes.lidar.terrain.classify_ground",
+      "x": -80.0,
+      "y": 180.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "strategy": "pmf"
+        }
+      }
+    },
+    {
+      "iid": "2b2c7799",
+      "id": "lynceus.nodes.lidar.terrain.generate_chm",
+      "x": 480.0,
+      "y": -20.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "pit_free": true
+        }
+      }
+    },
+    {
+      "iid": "52e300af",
+      "id": "lynceus.nodes.lidar.terrain.generate_dtm",
+      "x": 200.0,
+      "y": -120.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "resolution": 0.3,
+          "smooth_sigma": 0.5
+        }
+      }
+    },
+    {
+      "iid": "0930636f",
+      "id": "lynceus.nodes.lidar.terrain.generate_dsm",
+      "x": 200.0,
+      "y": -20.0,
+      "label": "",
+      "config": {
+        "pipeline": {
+          "resolution": 0.3,
+          "nodata_value": -9999.0
+        }
+      }
+    },
+    {
+      "iid": "5b1a7730",
+      "id": "lynceus.nodes.lidar.source.load_las_laz",
+      "x": -340.0,
+      "y": 180.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "1d0f2b07",
+      "id": "forestry.crown_delineation",
+      "x": 1040.0,
+      "y": -20.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "58a456ff",
+      "id": "forestry.treetops",
+      "x": 760.0,
+      "y": 60.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "eddeb904",
+      "id": "forestry.height_strata",
+      "x": 760.0,
+      "y": -100.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "f4221c26",
+      "id": "forestry.canopy_gaps",
+      "x": 760.0,
+      "y": -200.0,
+      "label": "",
+      "config": {}
+    },
+    {
+      "iid": "06afc806",
+      "id": "forestry.area_based",
+      "x": 760.0,
+      "y": 160.0,
+      "label": "",
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "0930636f",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "52e300af",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "52e300af",
+      "src_out": 1,
+      "dst": "2b2c7799",
+      "dst_in": 0,
+      "out_type": "dtm_mosaic",
+      "in_type": "dtm_mosaic"
+    },
+    {
+      "src": "0930636f",
+      "src_out": 1,
+      "dst": "2b2c7799",
+      "dst_in": 1,
+      "out_type": "dsm_mosaic",
+      "in_type": "dsm_mosaic"
+    },
+    {
+      "src": "5b1a7730",
+      "src_out": 0,
+      "dst": "45794873",
+      "dst_in": 0,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    },
+    {
+      "src": "2b2c7799",
+      "src_out": 0,
+      "dst": "58a456ff",
+      "dst_in": 0,
+      "out_type": "chm_mosaic",
+      "in_type": "chm_mosaic"
+    },
+    {
+      "src": "58a456ff",
+      "src_out": 0,
+      "dst": "1d0f2b07",
+      "dst_in": 1,
+      "out_type": "vector",
+      "in_type": "vector"
+    },
+    {
+      "src": "2b2c7799",
+      "src_out": 0,
+      "dst": "1d0f2b07",
+      "dst_in": 0,
+      "out_type": "chm_mosaic",
+      "in_type": "chm_mosaic"
+    },
+    {
+      "src": "2b2c7799",
+      "src_out": 0,
+      "dst": "eddeb904",
+      "dst_in": 0,
+      "out_type": "chm_mosaic",
+      "in_type": "chm_mosaic"
+    },
+    {
+      "src": "2b2c7799",
+      "src_out": 0,
+      "dst": "f4221c26",
+      "dst_in": 0,
+      "out_type": "chm_mosaic",
+      "in_type": "chm_mosaic"
+    },
+    {
+      "src": "2b2c7799",
+      "src_out": 0,
+      "dst": "06afc806",
+      "dst_in": 0,
+      "out_type": "chm_mosaic",
+      "in_type": "chm_mosaic"
+    },
+    {
+      "src": "45794873",
+      "src_out": 0,
+      "dst": "06afc806",
+      "dst_in": 1,
+      "out_type": "point_cloud",
+      "in_type": "point_cloud"
+    }
+  ],
+  "view": {
+    "scale": 0.5630841121495327,
+    "cx": 474.1742738589212,
+    "cy": 63.93360995850623
+  },
+  "name": "Inventario forestal (LiDAR + extensiones)",
+  "template": {
+    "name": "Inventario forestal (LiDAR + extensiones)",
+    "description": "Inventario forestal completo desde un vuelo LiDAR: clasifica el suelo con PMF, genera DTM/DSM a 0.3 m y un CHM sin pits, y corre los 5 nodos forestry (ápices, copas, claros, estratos y métricas por área con nube de puntos). REQUIERE el pack forestry instalado (treetops.lxpkg, crown_delineation.lxpkg, area_based.lxpkg, canopy_gaps.lxpkg, height_strata.lxpkg desde el repo de extensiones): sin él, esos nodos salen como no disponibles. Los nodos forestry son experimentales (EULA propia, precisión sin verificar): valida con un profesional antes del uso operativo. Elige tu LAZ en el Load y corre: vectores, métricas y tablas listos para QGIS con estilos incluidos.",
+    "author": "Taritolay, Nicolás Daniel",
+    "version": "0.1",
+    "tags": ["lidar", "forestal", "inventario", "dosel", "chm", "extensiones"]
+  }
+}

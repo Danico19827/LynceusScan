@@ -24,7 +24,8 @@ NODE_DESCRIPTION = (
     "data are computed; the rest remain NODATA.<br><br>"
     "<b>Process:</b> The DTM and DSM mosaics are aligned by their overlapping "
     "bounds, then subtracted. Heights are clamped to [min, max] range, "
-    "and optional Gaussian smoothing reduces noise in the canopy surface.<br><br>"
+    "and optional Gaussian smoothing reduces noise in the canopy surface. "
+    "An optional pit-free composite fills small pits for tree work.<br><br>"
     "<b>Tips:</b> Increase <i>smooth sigma</i> for smoother canopy surfaces in "
     "forestry analysis. Lower it for individual tree crown detection. "
     "Adjust <i>max height</i> if processing very tall vegetation (e.g. "
@@ -93,6 +94,13 @@ PROCESSING_SPECS = {
             "impact": "When enabled, isolated NODATA cells surrounded by valid data are filled. Useful for smoothing DTM/DSM misalignment artifacts. Disable if gaps represent real no-data areas.",
             "group": "Post-Processing",
         },
+        "pit_free": {
+            "type": "bool",
+            "default": False,
+            "description": "Fill canopy pits with a multi-resolution maximum composite.",
+            "impact": "Mosaic-level approximation of the Khosravipour pit-free CHM: removes small pits from penetrating returns for cleaner tree crowns. Slightly raises crown edges; keep off for precise height measurements. Only affects the DSM side.",
+            "group": "Smoothing",
+        },
         "output_resolution": {
             "type": "float",
             "default": 0.0,
@@ -156,6 +164,11 @@ def barrier_generate_chm(ctx: dict) -> dict:
             "node": NODE_ID,
             "warnings": ["DTM or DSM without valid data; CHM written as all-NODATA"],
         }
+
+    if ctx.get("pit_free", False):
+        from lynceus.processing.raster import pit_free_canopy
+
+        dsm_arr = pit_free_canopy(dsm_arr, nodata)
 
     compute_chm(
         dtm, dsm, out_path, crs=clean_crs(ctx.get("crs")) or crs_dtm or crs_dsm,

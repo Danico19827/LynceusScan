@@ -4,7 +4,11 @@ from lynceus.ui.nodes.node_item import NodeItem
 from lynceus.ui.nodes.widgets.input_file import InputFileNodeItem
 from lynceus.ui.nodes.widgets.load_las_laz import LoadLasLazNodeItem
 from lynceus.ui.nodes.widgets.merge import MergeNodeItem
-from lynceus.ui.nodes.widgets.strategy import MethodNodeItem, StrategyNodeItem
+from lynceus.ui.nodes.widgets.strategy import (
+    DerivativeNodeItem,
+    MethodNodeItem,
+    StrategyNodeItem,
+)
 
 _ITEM_FACTORIES = {
     "lynceus.nodes.lidar.source.load_las_laz": LoadLasLazNodeItem,
@@ -16,6 +20,7 @@ _ITEM_FACTORIES = {
     "lynceus.nodes.lidar.terrain.classify_ground": MethodNodeItem,
     # Merge products per strategy (one Consolidate instance per product).
     "lynceus.nodes.flow.consolidate": MergeNodeItem,
+    "lynceus.nodes.raster.ops.terrain_derivatives": DerivativeNodeItem,
 }
 
 

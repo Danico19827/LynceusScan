@@ -690,7 +690,95 @@ def _generic_classes(features, field: str):
     return classes
 
 
-def _build_vector_qml(field: str, classes, name: str) -> str:
+def _vector_geometry_kind(vector_path: str) -> str | None:
+    """Layer geometry kind from metadata, without scanning features.
+
+    Returns ``"point"``, ``"line"`` or ``"polygon"`` (None when unknown):
+    GPKG declares one type per layer in ``gpkg_geometry_columns``;
+    GeoJSON takes the first feature geometry from a bounded head read.
+    Unknown kinds keep the legacy fill symbols.
+    """
+    suffix = Path(vector_path).suffix.lower()
+    type_name: str | None = None
+    if suffix == ".gpkg":
+        import sqlite3
+
+        try:
+            con = sqlite3.connect(f"file:{vector_path}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT geometry_type_name FROM gpkg_geometry_columns"
+                    " LIMIT 1"
+                ).fetchone()
+            finally:
+                con.close()
+        except Exception:
+            return None
+        if row and row[0]:
+            type_name = str(row[0])
+    elif suffix == ".geojson":
+        import re
+
+        try:
+            with open(vector_path, encoding="utf-8") as handle:
+                head = handle.read(131072)
+        except OSError:
+            return None
+        match = re.search(
+            r'"geometry"\s*:\s*\{\s*"type"\s*:\s*"(\w+)"', head)
+        if match:
+            type_name = match.group(1)
+    if not type_name:
+        return None
+    name = type_name.upper()
+    if "POINT" in name:
+        return "point"
+    if "LINE" in name or "CURVE" in name or "STRING" in name:
+        return "line"
+    if "POLYGON" in name or "SURFACE" in name:
+        return "polygon"
+    return None
+
+
+def _symbol_xml(index: int, color: str, geom_kind: str) -> str:
+    """One graduated-class symbol for the layer geometry kind."""
+    if geom_kind == "point":
+        return (
+            f'      <symbol alpha="1" force_rhr="0" type="marker" name="{index}">'
+            f'<layer pass="0" class="SimpleMarker" locked="0">'
+            f'<prop k="color" v="{color}"/>'
+            f'<prop k="name" v="circle"/>'
+            f'<prop k="size" v="2.5"/>'
+            f'<prop k="size_unit" v="MM"/>'
+            f'<prop k="outline_style" v="no"/>'
+            f'<prop k="outline_color" v="#000000"/>'
+            f'<prop k="outline_width" v="0"/>'
+            f'</layer></symbol>'
+        )
+    if geom_kind == "line":
+        return (
+            f'      <symbol alpha="1" force_rhr="0" type="line" name="{index}">'
+            f'<layer pass="0" class="SimpleLine" locked="0">'
+            f'<prop k="line_color" v="{color}"/>'
+            f'<prop k="line_width" v="0.6"/>'
+            f'<prop k="line_width_unit" v="MM"/>'
+            f'</layer></symbol>'
+        )
+    return (
+        f'      <symbol alpha="1" force_rhr="0" type="fill" name="{index}">'
+        f'<layer pass="0" class="SimpleFill" locked="0">'
+        f'<prop k="color" v="{color}"/>'
+        # No outline: dense grids moiré in QGIS with thousands of
+        # stroked cells (same reason the 2D viewer paints fill-only).
+        f'<prop k="outline_style" v="no"/>'
+        f'<prop k="outline_color" v="#000000"/>'
+        f'<prop k="outline_width" v="0"/>'
+        f'</layer></symbol>'
+    )
+
+
+def _build_vector_qml(field: str, classes, name: str,
+                      geom_kind: str = "polygon") -> str:
     ranges_xml = []
     symbols_xml = []
     for i, (_lo, _hi, color, label) in enumerate(classes):
@@ -698,17 +786,7 @@ def _build_vector_qml(field: str, classes, name: str) -> str:
             f'        <range symbol="{i}" lower="{_lo:.1f}" '
             f'upper="{_hi:.1f}" label="{saxutils.escape(label)}"/>'
         )
-        symbols_xml.append(
-            f'      <symbol alpha="1" force_rhr="0" type="fill" name="{i}">'
-            f'<layer pass="0" class="SimpleFill" locked="0">'
-            f'<prop k="color" v="{color}"/>'
-            # No outline: dense grids moiré in QGIS with thousands of
-            # stroked cells (same reason the 2D viewer paints fill-only).
-            f'<prop k="outline_style" v="no"/>'
-            f'<prop k="outline_color" v="#000000"/>'
-            f'<prop k="outline_width" v="0"/>'
-            f'</layer></symbol>'
-        )
+        symbols_xml.append(_symbol_xml(i, color, geom_kind))
     ranges_str = "\n".join(ranges_xml)
     symbols_str = "\n".join(symbols_xml)
     color1 = classes[0][2]
@@ -746,7 +824,8 @@ def style_vector_file(
     ``field``, ``classes``, and ``name`` may come from the node. Missing
     classes are computed from the selected field's real range. ``field``
     is required when ``classes`` is given (caught early instead of
-    failing inside the XML builder).
+    failing inside the XML builder). Symbol types follow the layer
+    geometry (marker/line/fill); unknown kinds keep legacy fills.
     """
     vpath = Path(vector_path).resolve()
     if not vpath.exists():
@@ -757,6 +836,7 @@ def style_vector_file(
     if classes is not None and field is None:
         logger.warning(f"Vector style for {vpath.name} needs a field with classes")
         return False
+    geom_kind = _vector_geometry_kind(str(vpath)) or "polygon"
 
     stem = vpath.stem
     style_name = (name or f"{stem} \u2014 {field}") if field else stem
@@ -782,7 +862,8 @@ def style_vector_file(
         style_name = (name or f"{stem} \u2014 {field}") if field else stem
 
     try:
-        qml_content = _build_vector_qml(field, classes, style_name)
+        qml_content = _build_vector_qml(field, classes, style_name,
+                                        geom_kind)
     except Exception as e:
         logger.error(f"Error generating vector QML for {vpath.name}: {e}")
         return False

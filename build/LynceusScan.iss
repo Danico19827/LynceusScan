@@ -11,7 +11,7 @@
 ; NOTE: keep MyAppVersion in sync with lynceus/__init__.py::__version__.
 
 #define MyAppName "LynceusScan"
-#define MyAppVersion "0.1.0b3"
+#define MyAppVersion "0.1.0b4"
 #define MyAppPublisher "Taritolay, Nicolas Daniel"
 #define MyAppURL "https://github.com/Danico19827/LynceusScan"
 #define MyAppExeName "LynceusScan.exe"

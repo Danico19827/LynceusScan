@@ -68,6 +68,87 @@ def quality_mask(record) -> np.ndarray | None:
     return ~np.asarray(record.withheld, dtype=bool)
 
 
+def bilinear_dtm_reference(xs, ys, dtm_path: str, owner: str = ""):
+    """Sample a DTM mosaic with bilinear interpolation.
+
+    Returns a float64 array aligned with ``xs``/``ys`` with NaN where any
+    of the 4 interpolation corners falls outside coverage or on NODATA.
+    Bilinear (not nearest-cell) because nearest stairsteps slopes by up
+    to half a cell. GeoTIFF cells are pixel-is-area (value at the
+    center), so the fractional position subtracts half a cell. The read
+    is windowed to the point extent plus one cell: tile-bounded memory
+    no matter the mosaic size. Shared by Normalize/Denormalize Heights.
+    """
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    ref = np.full(xs.shape, np.nan)
+    if xs.size == 0:
+        return ref
+    tag = f"{owner}: " if owner else ""
+    try:
+        import rasterio
+        from rasterio.windows import Window
+    except Exception as exc:
+        raise RuntimeError(
+            f"{tag}DTM sampling unavailable ({exc})"
+        ) from exc
+    try:
+        with rasterio.open(str(dtm_path)) as src:
+            tr = src.transform
+            if tr.b != 0 or tr.d != 0:
+                raise RuntimeError(f"{tag}rotated DTM unsupported")
+            nodata = src.nodata
+            height, width = src.shape
+            cols_f = (xs - tr.c) / tr.a - 0.5
+            if tr.e > 0:
+                rows_f = (ys - tr.f) / tr.e - 0.5
+            else:
+                rows_f = (tr.f - ys) / (-tr.e) - 0.5
+            x0 = np.floor(cols_f).astype(np.int64)
+            y0 = np.floor(rows_f).astype(np.int64)
+            c0 = max(int(x0.min()), 0)
+            r0 = max(int(y0.min()), 0)
+            c1 = min(int(x0.max()) + 1, width - 1)
+            r1 = min(int(y0.max()) + 1, height - 1)
+            if c1 < c0 or r1 < r0:
+                return ref
+            band = src.read(
+                1, window=Window(c0, r0, c1 - c0 + 1, r1 - r0 + 1)
+            ).astype(np.float64)
+            lx = x0 - c0
+            ly = y0 - r0
+            fx = cols_f - x0
+            fy = rows_f - y0
+            ok = (
+                (lx >= 0) & (lx + 1 < band.shape[1])
+                & (ly >= 0) & (ly + 1 < band.shape[0])
+            )
+            if not ok.any():
+                return ref
+            idx = np.flatnonzero(ok)
+            v00 = band[ly[idx], lx[idx]]
+            v10 = band[ly[idx], lx[idx] + 1]
+            v01 = band[ly[idx] + 1, lx[idx]]
+            v11 = band[ly[idx] + 1, lx[idx] + 1]
+            corners = np.stack((v00, v10, v01, v11))
+            if nodata is not None:
+                good = np.all(corners != float(nodata), axis=0)
+            else:
+                good = np.ones(idx.size, dtype=bool)
+            fx_i, fy_i = fx[idx][good], fy[idx][good]
+            ref[idx[good]] = (
+                v00[good] * (1 - fx_i) * (1 - fy_i)
+                + v10[good] * fx_i * (1 - fy_i)
+                + v01[good] * (1 - fx_i) * fy_i
+                + v11[good] * fx_i * fy_i
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"{tag}DTM sampling failed ({exc})") from exc
+    return ref
+
+
 def point_src(tile: dict, ctx: dict) -> str:
     """Resolve the point-cloud file a tile-task should read (see module docstring).
 

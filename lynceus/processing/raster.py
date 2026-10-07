@@ -72,6 +72,22 @@ PMF_INTERCEPT = 0.3
 PMF_INITIAL_WINDOW_M = 2.0
 PMF_MAX_WINDOW_M = 8.0
 
+# MCC defaults; node configuration can override them.
+MCC_CELL_SIZE = 1.0
+MCC_SCALE = 1.5
+MCC_THRESHOLD = 0.3
+MCC_DOMAINS = 3
+MCC_ITERATIONS = 10
+MCC_MAX_FIT_CENTERS = 1500
+MCC_CONVERGENCE = 0.005
+
+# ATIN defaults; node configuration can override them.
+ATIN_CELL_SIZE = 1.0
+ATIN_SEED_M = 20.0
+ATIN_MAX_ANGLE = 6.0
+ATIN_MAX_DIST = 1.0
+ATIN_ITERATIONS = 10
+
 
 def fill_holes(
     array: np.ndarray,
@@ -191,9 +207,27 @@ def progressive_morphological_filter(
 ) -> np.ndarray:
     """Return a boolean ground mask using the Zhang et al. (2003) PMF.
 
-    A minimum-elevation surface is built per cell and processed with growing
-    morphological windows. Cells whose elevation change stays below the
-    window-dependent threshold are retained as ground.
+    Reference: Zhang, Chen, Whitman, Shyu, Yan, Zhang, "A Progressive
+    Morphological Filter for Removing Nonground Measurements From Airborne
+    LIDAR Data", IEEE Trans. Geosci. Remote Sens. 41(4):872-878, 2003
+    (DOI 10.1109/TGRS.2003.814625).
+
+    Math implemented: a minimum-elevation surface is opened with a growing
+    series of odd windows ``w_k`` (cells; ``+2`` per iteration from the
+    initial window up to the maximum). At iteration ``k`` cells are removed
+    when ``surface - opened > dh_T(k)`` with the paper's differential
+    threshold ``dh_T(k) = s * (w_k - w_{k-1}) * c + dh_0`` (``w_0 = 0``),
+    where ``s`` = ``slope``, ``c`` = ``cell_size`` and ``dh_0`` =
+    ``intercept``. Removed cells take the opened value for the next
+    iteration. Units: meters throughout.
+
+    Deliberate refinement vs the paper: the paper labels every point inside
+    a surviving cell as ground; we additionally require ``z <= surface +
+    s*c + dh_0`` to suppress low-vegetation commission inside ground cells.
+    On slopes steeper than ``s`` this gate may omit true ground — use
+    CSF/ATIN there (see their fichas). Standards: output codes travel via
+    ``output_class`` (default 2 = ground per ASPRS LAS 1.4); ``withheld``
+    points are excluded upstream and never labeled (see _classify_base).
     """
     if x.size == 0:
         return np.zeros(0, dtype=bool)
@@ -222,18 +256,25 @@ def progressive_morphological_filter(
     surface = np.where(valid, grid, fill)
     ground = valid.copy()
 
-    window_m = initial_window_m
-    while window_m <= max_window_m:
-        window_cells = max(2, int(round(window_m / cell_size)))
+    def _odd_cells(meters: float) -> int:
+        n = max(3, int(round(meters / cell_size)))
+        return n if n % 2 else n + 1
+
+    window_cells = _odd_cells(initial_window_m)
+    max_cells = max(window_cells, _odd_cells(max_window_m))
+    last_cells = 0
+    while True:
         opened = maximum_filter(minimum_filter(surface, size=window_cells), size=window_cells)
         diff = surface - opened
-        threshold = slope * window_m + intercept
+        threshold = slope * (window_cells - last_cells) * cell_size + intercept
         removed = ground & (diff > threshold)
-        if not removed.any():
+        if removed.any():
+            ground &= ~removed
+            surface = np.where(removed, opened, surface)
+        last_cells = window_cells
+        if window_cells >= max_cells:
             break
-        ground &= ~removed
-        surface = np.where(removed, opened, surface)
-        window_m *= 2.0
+        window_cells = min(max_cells, window_cells + 2)
 
     cell_idx = np.flatnonzero(ground)
     surface_flat = surface.reshape(-1)
@@ -252,25 +293,36 @@ def cloth_simulation_filter(
     cell_size: float = 0.5,
     class_threshold: float = 0.5,
     rigidness: int = 3,
-    iterations: int = 300,
-    gravity: float = 0.2,
+    iterations: int = 1000,
+    gravity: float = 0.05,
     memory_budget_bytes: int | None = None,
     tile_id: str | None = None,
 ) -> np.ndarray:
     """Return a boolean ground mask using a simplified Cloth Simulation
     Filter (Zhang et al., 2016).
 
-    Heights are flipped so bare earth becomes the ceiling; a cloth grid
-    starts above everything and settles under gravity, spring tension to
-    its 4-neighbors (``rigidness`` passes per step) and collision with
-    the per-cell maximum. Points close under the settled cloth are
-    ground; small objects stay buried because neighbor tension holds
-    the cloth above them.
+    Reference: Zhang, Qi, Hu, Zhong, Wu, Zhang, "An Easy-to-Use Airborne
+    LiDAR Data Filtering Method Based on Cloth Simulation", Remote Sens.
+    8(4):283, 2016 (DOI 10.3390/rs8040283).
+
+    Math implemented: heights are flipped (``zinv = max - z``) so bare
+    earth becomes the ceiling; a cloth grid starts above everything and
+    settles under uniform gravity (``gravity`` meters per iteration),
+    spring relaxation toward the 4-neighbor average (``rigidness`` passes
+    per step) and collision with the per-cell maximum. Points within
+    ``class_threshold`` meters under the settled cloth are ground; small
+    objects stay buried because neighbor tension holds the cloth above
+    them. Units: meters throughout. Gravity is deliberately small
+    (0.05 m/iteration): tension then dominates and the cloth bridges
+    roof pits instead of sagging into them (flat roofs would otherwise
+    read as ground); ``iterations`` covers 50 m of relief at the default.
 
     Simplified vs the paper: uniform gravity, fixed stiffness from
     ``rigidness`` (1 = flat/loosely draped, 3 = tight/steep-following),
     nearest-cell collision, no slope post-processing. ``rigidness``
-    accepts 1..3.
+    accepts 1..3. Standards: output codes travel via ``output_class``
+    (default 2 = ground per ASPRS LAS 1.4); ``withheld`` points are
+    excluded upstream and never labeled (see _classify_base).
     """
     if x.size == 0:
         return np.zeros(0, dtype=bool)
@@ -330,13 +382,21 @@ def simple_morphological_filter(
 ) -> np.ndarray:
     """Return a boolean ground mask using a simplified SMRF (Pingel 2013).
 
-    Like PMF this opens a minimum-elevation surface with growing windows,
-    but the elevation threshold stays FIXED at every scale (PMF grows it
-    with the window) while the window itself adapts to local slope:
-    steeper cells get larger windows, so flat/agricultural ground is
-    cleaned aggressively without stripping real relief. Simplified vs the
-    paper: quantized window levels instead of truly per-cell windows, no
-    final slope-based relabeling.
+    Reference: Pingel, Clarke, McBride, "An Improved Simple Morphological
+    Filter for Binary LiDAR Data", IEEE Geosci. Remote Sens. Lett.
+    10(5):1105-1109, 2013.
+
+    Math implemented: like PMF this opens a minimum-elevation surface
+    with growing windows, but the elevation threshold stays FIXED at
+    every scale (PMF grows it with the window) while the window itself
+    adapts to local slope: steeper cells get larger windows, so
+    flat/agricultural ground is cleaned aggressively without stripping
+    real relief. Units: meters throughout. Simplified vs the paper:
+    quantized window levels instead of truly per-cell windows, no final
+    slope-based relabeling. Scope by design: flat-to-mild terrain;
+    slopes go to PMF/CSF. Standards: output codes travel via
+    ``output_class`` (default 2 = ground per ASPRS LAS 1.4); ``withheld``
+    points are excluded upstream and never labeled (see _classify_base).
     """
     if x.size == 0:
         return np.zeros(0, dtype=bool)
@@ -387,6 +447,456 @@ def simple_morphological_filter(
     cell_lookup[cell_idx] = surface_flat[cell_idx]
     is_ground = cell_lookup[flat]
     return np.isfinite(is_ground) & (z <= is_ground + threshold)
+
+
+# ---------------------------------------------------------------------------
+# Multiscale Curvature Classification (MCC).
+# ---------------------------------------------------------------------------
+
+def multiscale_curvature_filter(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    cell_size: float = MCC_CELL_SIZE,
+    scale: float = MCC_SCALE,
+    threshold: float = MCC_THRESHOLD,
+    domains: int = MCC_DOMAINS,
+    max_iterations: int = MCC_ITERATIONS,
+    memory_budget_bytes: int | None = None,
+    tile_id: str | None = None,
+) -> np.ndarray:
+    """Return a boolean ground mask using Multiscale Curvature
+    Classification (Evans & Hudak, 2007).
+
+    Reference: Evans, Hudak, "A Multiscale Curvature Algorithm for
+    Classifying Discrete Return LiDAR in Forested Environments", IEEE
+    Trans. Geosci. Remote Sens. 45(4):1029-1038, 2007
+    (DOI 10.1109/TGRS.2006.890412).
+
+    Math implemented: a minimum-elevation surface is fit with a thin-plate
+    spline (``scipy.interpolate.RBFInterpolator``, thin-plate kernel);
+    cells deviating more than ``threshold`` meters above the plate are
+    removed as non-ground and the plate refits until fewer than 0.5% of
+    cells change (``max_iterations`` cap). This repeats over ``domains``
+    scale domains with plate slack ``(scale + d) ** 2`` for domain ``d``,
+    so coarser domains bridge larger objects. Only positive deviations
+    are removed (pits below the plate stay ground, per the paper's
+    default). Units: meters throughout.
+
+    Mappings vs the paper (declared): the paper's scale parameter is
+    carried as ridge smoothing ``(scale + d) ** 2`` of the RBF fit
+    (heuristic validated on fixtures, see tests/test_ground_filter_math);
+    the plate fits a deterministic strided subsample of at most 1500 cell
+    centers (dense solve, exact on the subsample). Final labeling matches
+    the PMF/SMRF convention (``z <= surface + threshold`` inside surviving
+    cells). Standards: output codes travel via ``output_class`` (default 2
+    = ground per ASPRS LAS 1.4); ``withheld`` points are excluded upstream
+    and never labeled (see _classify_base).
+    """
+    from scipy.interpolate import RBFInterpolator
+
+    if x.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    x0, y0, cols, rows = _point_grid_shape(
+        x, y, cell_size, memory_budget_bytes, "MCC", tile_id
+    )
+    c = np.clip(np.floor((x - x0) / cell_size).astype(np.int64), 0, cols - 1)
+    r = np.clip(np.floor((y - y0) / cell_size).astype(np.int64), 0, rows - 1)
+    flat = r * cols + c
+
+    grid = np.full(rows * cols, np.inf, dtype=np.float64)
+    np.minimum.at(grid, flat, z)
+    grid = grid.reshape(rows, cols)
+    valid = np.isfinite(grid)
+    if not valid.any():
+        return np.zeros(x.size, dtype=bool)
+
+    ground = valid.copy()
+    ys, ex = np.mgrid[0:rows, 0:cols]
+    eval_pts = np.column_stack(
+        (
+            x0 + (ex.reshape(-1) + 0.5) * cell_size,
+            y0 + (ys.reshape(-1) + 0.5) * cell_size,
+        )
+    )
+    surface = grid.reshape(-1)
+    for domain in range(max(1, int(domains))):
+        smoothing = (float(scale) + domain) ** 2
+        for _ in range(max(1, int(max_iterations))):
+            idx = np.flatnonzero(ground)
+            if idx.size == 0:
+                break
+            step = max(1, int(np.ceil(idx.size / MCC_MAX_FIT_CENTERS)))
+            fit_idx = idx[::step]
+            fit_pts = np.column_stack(
+                (
+                    x0 + (fit_idx % cols + 0.5) * cell_size,
+                    y0 + (fit_idx // cols + 0.5) * cell_size,
+                )
+            )
+            plate = RBFInterpolator(
+                fit_pts,
+                surface[fit_idx],
+                kernel="thin_plate_spline",
+                smoothing=smoothing,
+            )(eval_pts).reshape(rows, cols)
+            curvature = np.where(ground, grid - plate, -np.inf)
+            removed = ground & (curvature > threshold)
+            n_removed = int(removed.sum())
+            if n_removed == 0:
+                break
+            ground &= ~removed
+            if n_removed < max(1, MCC_CONVERGENCE * idx.size):
+                break
+
+    cell_lookup = np.where(ground, grid, np.nan).reshape(-1)
+    is_ground = cell_lookup[flat]
+    return np.isfinite(is_ground) & (z <= is_ground + threshold)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive TIN ground filter (ATIN).
+# ---------------------------------------------------------------------------
+
+def adaptive_tin_filter(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    cell_size: float = ATIN_CELL_SIZE,
+    seed_m: float = ATIN_SEED_M,
+    max_angle_deg: float = ATIN_MAX_ANGLE,
+    max_dist_m: float = ATIN_MAX_DIST,
+    max_iterations: int = ATIN_ITERATIONS,
+    memory_budget_bytes: int | None = None,
+    tile_id: str | None = None,
+) -> np.ndarray:
+    """Return a boolean ground mask using an Adaptive TIN filter
+    (Axelsson, 2000).
+
+    Reference: Axelsson, "DEM from laser scanner data using adaptive TIN
+    models", Int. Arch. Photogramm. Remote Sens. 33(B4/1):110-117, 2000.
+
+    Math implemented: a minimum-elevation surface is seeded with the
+    lowest cell of each ``seed_m`` block; a Delaunay TIN over the seed
+    centers densifies iteratively: an unclassified cell inside a facet
+    joins the ground set when its absolute height above the facet plane
+    is within ``max_dist_m`` AND its maximum angle to the three facet
+    vertices (angle between vertex-to-point segment and facet plane) is
+    within ``max_angle_deg``. Iteration stops when no cell joins or
+    ``max_iterations`` is reached. Units: meters and degrees throughout.
+
+    Mappings vs the paper (declared): the paper triangulates raw points;
+    here cells stand in for points (grid-based adaptation, consistent
+    with the PMF/CSF/SMRF/MCC implementations); the paper's maximum-edge
+    guard is not implemented, so triangles may span unseeded gaps and the
+    seed spacing (``seed_m``) must exceed the largest building. A
+    hull-closing pass grows the ground set across 8-adjacency with the
+    same distance criterion (the TIN alone never expands past the seed
+    convex hull and would orphan a rim); steps taller than ``max_dist_m``
+    still stop the growth. Final labeling matches the family convention
+    (``z <= surface + max_dist_m`` inside surviving cells). Standards:
+    output codes travel via ``output_class`` (default 2 = ground per
+    ASPRS LAS 1.4); ``withheld`` points are excluded upstream and never
+    labeled (see _classify_base).
+    """
+    from scipy.spatial import Delaunay, QhullError
+
+    if x.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    x0, y0, cols, rows = _point_grid_shape(
+        x, y, cell_size, memory_budget_bytes, "ATIN", tile_id
+    )
+    c = np.clip(np.floor((x - x0) / cell_size).astype(np.int64), 0, cols - 1)
+    r = np.clip(np.floor((y - y0) / cell_size).astype(np.int64), 0, rows - 1)
+    flat = r * cols + c
+
+    grid = np.full(rows * cols, np.inf, dtype=np.float64)
+    np.minimum.at(grid, flat, z)
+    grid = grid.reshape(rows, cols)
+    valid = np.isfinite(grid)
+    if not valid.any():
+        return np.zeros(x.size, dtype=bool)
+
+    surface = grid.reshape(-1)
+    valid_flat = valid.reshape(-1)
+    centers_x = x0 + (np.tile(np.arange(cols), rows) + 0.5) * cell_size
+    centers_y = y0 + (np.repeat(np.arange(rows), cols) + 0.5) * cell_size
+
+    # Seed: lowest valid cell of each seed_m block.
+    block = max(1, int(round(float(seed_m) / cell_size)))
+    block_r = np.repeat(np.arange(rows), cols) // block
+    block_c = np.tile(np.arange(cols), rows) // block
+    seed_idx = []
+    for key in np.unique(np.stack((block_r[valid_flat],
+                                   block_c[valid_flat]), axis=1), axis=0):
+        in_block = ((block_r == key[0]) & (block_c == key[1])
+                    & valid_flat)
+        members = np.flatnonzero(in_block)
+        if members.size:
+            seed_idx.append(members[int(np.argmin(surface[members]))])
+    ground = np.zeros(rows * cols, dtype=bool)
+    if seed_idx:
+        ground[np.asarray(seed_idx)] = True
+
+    max_angle = float(np.deg2rad(max_angle_deg))
+    for _ in range(max(1, int(max_iterations))):
+        pts = np.column_stack((centers_x[ground], centers_y[ground]))
+        if pts.shape[0] < 4:
+            break
+        try:
+            tri = Delaunay(pts)
+        except QhullError:
+            break
+        cand = np.flatnonzero(valid_flat & ~ground)
+        if cand.size == 0:
+            break
+        simplex = tri.find_simplex(
+            np.column_stack((centers_x[cand], centers_y[cand])))
+        inside = simplex >= 0
+        if not inside.any():
+            break
+        in_cand = cand[inside]
+        in_simp = simplex[inside]
+        verts = tri.simplices[in_simp]  # (M, 3) ground-set positions
+        vert_flat = np.asarray(
+            [np.flatnonzero(ground)[v] for v in verts.reshape(-1)]
+        ).reshape(verts.shape)
+        vx = centers_x[vert_flat]
+        vy = centers_y[vert_flat]
+        vz = surface[vert_flat]
+        trans = tri.transform[in_simp]  # (M, 3, 2)
+        rel = np.stack((centers_x[in_cand], centers_y[in_cand]),
+                       axis=1) - trans[:, 2, :]
+        bary12 = np.einsum("mij,mj->mi", trans[:, :2, :], rel)
+        bary0 = 1.0 - bary12.sum(axis=1)
+        plane_z = (bary0 * vz[:, 0] + bary12[:, 0] * vz[:, 1]
+                   + bary12[:, 1] * vz[:, 2])
+        dz = np.abs(surface[in_cand] - plane_z)
+        # Max angle vertex-to-point vs facet plane.
+        px = centers_x[in_cand]
+        py = centers_y[in_cand]
+        pz = surface[in_cand]
+        e1x, e1y, e1z = vx[:, 1] - vx[:, 0], vy[:, 1] - vy[:, 0], vz[:, 1] - vz[:, 0]
+        e2x, e2y, e2z = vx[:, 2] - vx[:, 0], vy[:, 2] - vy[:, 0], vz[:, 2] - vz[:, 0]
+        nx = e1y * e2z - e1z * e2y
+        ny = e1z * e2x - e1x * e2z
+        nz = e1x * e2y - e1y * e2x
+        norm_n = np.sqrt(nx * nx + ny * ny + nz * nz)
+        worst = np.zeros(in_cand.size)
+        for k in range(3):
+            dx = px - vx[:, k]
+            dy = py - vy[:, k]
+            dzv = pz - vz[:, k]
+            norm_d = np.sqrt(dx * dx + dy * dy + dzv * dzv)
+            denom = norm_d * norm_n
+            sin_a = np.where(denom > 0,
+                             np.abs(dx * nx + dy * ny + dzv * nz) / np.maximum(
+                                 denom, 1e-300), np.inf)
+            worst = np.maximum(worst, np.arcsin(np.clip(sin_a, 0.0, 1.0)))
+        add = np.zeros(rows * cols, dtype=bool)
+        join = (dz <= float(max_dist_m)) & (worst <= max_angle)
+        add[in_cand[join]] = True
+        if not add.any():
+            break
+        ground |= add
+
+    # Hull-closing pass: the TIN never expands past the seed convex hull,
+    # which would orphan a rim of valid cells. Grow the ground set across
+    # 8-adjacency with the same distance criterion (documented extension):
+    # a cell joins when it stands within ``max_dist_m`` of the lowest
+    # neighboring ground surface. Steps taller than the threshold (walls,
+    # terrace faces, canopy) still stop the growth.
+    from scipy.ndimage import binary_dilation, minimum_filter
+
+    ground_2d = ground.reshape(rows, cols)
+    for _ in range(2 * max(rows, cols)):
+        adjacent = (
+            binary_dilation(ground_2d, structure=np.ones((3, 3)))
+            & valid
+            & ~ground_2d
+        )
+        if not adjacent.any():
+            break
+        neighbor = minimum_filter(
+            np.where(ground_2d, grid, np.inf), size=3
+        )
+        with np.errstate(invalid="ignore"):
+            close_enough = np.abs(grid - neighbor) <= float(max_dist_m)
+        grown = adjacent & close_enough
+        if not grown.any():
+            break
+        ground_2d = ground_2d | grown
+    ground = ground_2d.reshape(-1)
+
+    cell_lookup = np.where(ground.reshape(rows, cols), grid,
+                           np.nan).reshape(-1)
+    is_ground = cell_lookup[flat]
+    return np.isfinite(is_ground) & (z <= is_ground + float(max_dist_m))
+
+
+# ---------------------------------------------------------------------------
+# Terrain derivatives (Horn 1981).
+# ---------------------------------------------------------------------------
+
+def _horn_gradients(arr: np.ndarray, cell_x: float, cell_y: float,
+                    nodata: float):
+    """Horn 3x3 weighted east/north gradients with a validity mask.
+
+    Only cells whose full 3x3 window is valid are computed; anything
+    else (including the 1-cell rim) is left to the caller as NODATA.
+    """
+    from scipy.ndimage import minimum_filter
+
+    valid = arr != nodata
+    window_ok = minimum_filter(valid, size=3, mode="constant", cval=False)
+    filled = np.where(valid, arr, 0.0).astype(np.float64)
+    n = filled[:-2, 1:-1]
+    s = filled[2:, 1:-1]
+    e = filled[1:-1, 2:]
+    w = filled[1:-1, :-2]
+    ne = filled[:-2, 2:]
+    nw = filled[:-2, :-2]
+    se = filled[2:, 2:]
+    sw = filled[2:, :-2]
+    dzdx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) / (8.0 * cell_x)
+    dzdy = ((nw + 2.0 * n + ne) - (sw + 2.0 * s + se)) / (8.0 * cell_y)
+    return dzdx, dzdy, window_ok[1:-1, 1:-1]
+
+
+def slope_from_dem(arr: np.ndarray, cell_x: float, cell_y: float | None = None,
+                   nodata: float = NODATA, z_factor: float = 1.0) -> np.ndarray:
+    """Return slope in degrees using Horn (1981) 3x3 operators.
+
+    Reference: Horn, "Hill shading and the reflectance map", Proc. IEEE
+    69(1):14-47, 1981 (DOI 10.1109/PROC.1981.11918).
+
+    Math implemented: ``slope = arctan(hypot(dzdx, dzdy))`` with Horn's
+    weighted differences (opposite neighbor 1x, orthogonal 2x) over the
+    cell size; ``z_factor`` exaggerates elevations first (ESRI-style).
+    Output degrees in [0, 90]. Cells whose 3x3 window touches NODATA
+    (including the 1-cell rim) read NODATA by design. Units: input meters,
+    output degrees.
+    """
+    if cell_y is None:
+        cell_y = cell_x
+    out = np.full(arr.shape, nodata, dtype=np.float64)
+    dzdx, dzdy, ok = _horn_gradients(arr, cell_x, cell_y, nodata)
+    with np.errstate(invalid="ignore"):
+        out[1:-1, 1:-1][ok] = np.degrees(
+            np.arctan(np.hypot(dzdx[ok], dzdy[ok]) * z_factor))
+    return out
+
+
+def aspect_from_dem(arr: np.ndarray, cell_x: float, cell_y: float | None = None,
+                    nodata: float = NODATA, z_factor: float = 1.0) -> np.ndarray:
+    """Return aspect in degrees clockwise from north (Horn 1981).
+
+    Same reference and operators as :func:`slope_from_dem`. Aspect is the
+    direction of steepest DESCENT: ``atan2(-dzdx, -dzdy)`` folded to
+    [0, 360), so a slope descending eastward reads 90 (East) and one
+    descending northward reads 0 (North). Flat cells (zero gradient)
+    read -1
+    (ArcGIS-style "no aspect", declared): 0 always means north, never
+    flat. Same NODATA window rule as slope. Units: input meters, output
+    degrees.
+    """
+    if cell_y is None:
+        cell_y = cell_x
+    out = np.full(arr.shape, nodata, dtype=np.float64)
+    dzdx, dzdy, ok = _horn_gradients(arr, cell_x, cell_y, nodata)
+    with np.errstate(invalid="ignore"):
+        raw = np.degrees(np.arctan2(-dzdx[ok] * z_factor,
+                                     -dzdy[ok] * z_factor)) % 360.0
+        flat = np.hypot(dzdx[ok], dzdy[ok]) == 0.0
+        raw[flat] = -1.0
+        out[1:-1, 1:-1][ok] = raw
+    return out
+
+
+def hillshade_from_dem(arr: np.ndarray, cell_x: float, cell_y: float | None = None,
+                        nodata: float = NODATA, azimuth_deg: float = 315.0,
+                        altitude_deg: float = 45.0,
+                        z_factor: float = 1.0) -> np.ndarray:
+    """Return hillshade 0-255 for a sun position (Horn 1981 + ESRI model).
+
+    Same reference and operators as :func:`slope_from_dem`; shading
+    follows the standard ``255 * (cos(zen)*cos(slope) + sin(zen)*
+    sin(slope)*cos(az - aspect))`` with azimuth clockwise from north and
+    ``zen = 90 - altitude``. Flat cells shade uniformly (the aspect term
+    vanishes with slope) regardless of the -1 aspect convention. Same
+    NODATA window rule as slope. Defaults 315/45 are the cartographic
+    standard (northwest light). Units: input meters, output 0-255.
+    """
+    if cell_y is None:
+        cell_y = cell_x
+    out = np.full(arr.shape, nodata, dtype=np.float64)
+    dzdx, dzdy, ok = _horn_gradients(arr, cell_x, cell_y, nodata)
+    with np.errstate(invalid="ignore"):
+        slope = np.arctan(np.hypot(dzdx[ok], dzdy[ok]) * z_factor)
+        aspect = np.radians(np.degrees(
+            np.arctan2(-dzdx[ok] * z_factor, -dzdy[ok] * z_factor)) % 360.0)
+        zen = np.radians(90.0 - altitude_deg)
+        az = np.radians(azimuth_deg)
+        out[1:-1, 1:-1][ok] = 255.0 * (
+            np.cos(zen) * np.cos(slope)
+            + np.sin(zen) * np.sin(slope) * np.cos(az - aspect))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Pit-free canopy compositing (Khosravipour et al. 2014, mosaic-level).
+# ---------------------------------------------------------------------------
+
+def pit_free_canopy(dsm: np.ndarray, nodata: float,
+                    factors: tuple[int, ...] = (1, 2, 4)) -> np.ndarray:
+    """Fill canopy pits with a multi-resolution maximum composite.
+
+    Reference: Khosravipour, Skidmore, Isenburg, Larrañaga, "Generating
+    Pit-free Canopy Height Models from Airborne Lidar",
+    Photogramm. Eng. Remote Sens. 80(9):863-872, 2014
+    (DOI 10.14358/PERS.80.9.863).
+
+    Math implemented: the DSM is block-max downsampled at each factor,
+    nearest-upsampled back, and composited per-pixel with a NODATA-aware
+    maximum. A pit cell (low between high neighbors) takes the coarser
+    maximum and fills. Units: input meters, output meters.
+
+    Mappings vs the paper (declared): the paper assigns LiDAR points to
+    multi-resolution rasters; here the already-gridded DSM mosaic is
+    composited, so sub-cell pit geometry is lost and crown edges bias
+    slightly upward (coarse maxima bleed outward). Use for tree
+    segmentation, not for precise height measurement. All-NODATA stacks
+    stay NODATA. Deterministic (no randomness, no ties to break).
+    """
+    grid = np.asarray(dsm, dtype=np.float64)
+    rows, cols = grid.shape
+    composite = np.full((rows, cols), -np.inf)
+    any_valid = np.zeros((rows, cols), dtype=bool)
+    for factor in dict.fromkeys(max(1, int(f)) for f in factors):
+        if factor <= 1:
+            coarse = grid
+        else:
+            import warnings
+
+            pad_r = (-rows) % factor
+            pad_c = (-cols) % factor
+            padded = np.pad(grid, ((0, pad_r), (0, pad_c)), mode="edge")
+            blocked = padded.reshape((rows + pad_r) // factor, factor,
+                                     (cols + pad_c) // factor, factor)
+            # All-NODATA blocks are legitimate (voids): nanmax warns
+            # with a plain RuntimeWarning that errstate cannot catch.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                coarse_small = np.nanmax(
+                    np.where(blocked == nodata, np.nan, blocked), axis=(1, 3))
+            coarse = np.repeat(np.repeat(coarse_small, factor, axis=0),
+                               factor, axis=1)[:rows, :cols]
+        valid = np.isfinite(coarse) & (coarse != nodata)
+        composite = np.where(valid & (coarse > composite), coarse, composite)
+        any_valid |= valid
+    return np.where(any_valid, composite, nodata)
 
 
 # ---------------------------------------------------------------------------

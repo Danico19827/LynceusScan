@@ -50,9 +50,9 @@ PROCESSING_SPECS = {
         },
         "csf_iterations": {
             "type": "int",
-            "default": 300,
+            "default": 1000,
             "minimum": 50,
-            "maximum": 1000,
+            "maximum": 3000,
             "description": "Settling iterations of the cloth simulation.",
             "impact": "More iterations settle complex scenes better at linear time cost. Rarely needs changing.",
             "group": "CSF Algorithm",
@@ -77,7 +77,7 @@ def get_config_defaults() -> dict:
         "csf_resolution": 0.5,
         "csf_threshold": 0.5,
         "csf_rigidness": 3,
-        "csf_iterations": 300,
+        "csf_iterations": 1000,
         "output_class": 2,
     }
 
@@ -97,7 +97,7 @@ def tile_classify_ground_csf(tile: dict, ctx: dict) -> dict:
             cell_size=float(ctx.get("csf_resolution", 0.5)),
             class_threshold=float(ctx.get("csf_threshold", 0.5)),
             rigidness=int(ctx.get("csf_rigidness", 3)),
-            iterations=int(ctx.get("csf_iterations", 300)),
+            iterations=int(ctx.get("csf_iterations", 1000)),
             memory_budget_bytes=ctx.get("_raster_grid_memory_budget_bytes"),
             tile_id=tile.get("tile_id"),
         )

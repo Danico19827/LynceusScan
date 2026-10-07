@@ -1,4 +1,4 @@
-# LynceusScan — public beta (0.1.0b3)
+# LynceusScan — public beta (0.1.0b4)
 
 > **Versión en español:** [README.es.md](README.es.md)
 
@@ -73,6 +73,24 @@ extension framework. **Not** included, by design — download them from the
 Bundled **project templates** (`templates/`, File → New From Template):
 a canopy-height-model workflow and an SfM multispectral NDVI flight —
 both core-only, ready to adapt to your own files.
+
+## Scope and limits (read this before trusting outputs)
+
+No silent magic: every algorithm documents what it can and cannot do.
+
+- **Classify Ground** ships four published methods, each with a known
+  scope. PMF keeps objects wider than its max window by design; SMRF is
+  flat-to-mild terrain by design and strips steep relief; CSF needs its
+  iterations to cover the tile's relief (defaults cover 50 m) and has no
+  slope post-processing; MCC is best under dense canopy without ground
+  returns. Outside its scope a method degrades gracefully and warns —
+  it never pretends certainty.
+- **Validation is fixture-based**: analytic synthetic scenes with known
+  answers plus a Type I/II benchmark, all in the open test suite. That
+  proves fidelity to the published papers, not accuracy on your survey.
+  Field accuracy is the operator's QA task — check against control
+  points before operational use, exactly as the ASPRS/USGS standards
+  require.
 
 ## Make it yours: write an extension
 

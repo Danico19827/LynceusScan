@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Taritolay, Nicolás Daniel <lynceusscan@gmail.com>
-"""Tests for the Classify Ground strategy family (U-4: PMF/CSF/SMRF).
+"""Tests for the Classify Ground strategy family (PMF/CSF/SMRF/MCC).
 
 Mask-level invariants on synthetic clouds (no laspy), family discovery
 (base inert, one instance per method), effective capabilities per
@@ -19,7 +19,9 @@ import numpy as np
 from lynceus.nodes.ports import PortType
 from lynceus.plugins.registry import manager
 from lynceus.processing.raster import (
+    adaptive_tin_filter,
     cloth_simulation_filter,
+    multiscale_curvature_filter,
     progressive_morphological_filter,
     simple_morphological_filter,
 )
@@ -54,6 +56,14 @@ MASKS = {
     "smrf": lambda x, y, z: simple_morphological_filter(
         x, y, z, cell_size=1.0, slope=0.2, max_window_m=18.0,
         threshold=0.4,
+    ),
+    "mcc": lambda x, y, z: multiscale_curvature_filter(
+        x, y, z, cell_size=1.0, scale=1.5, threshold=0.5,
+        domains=3, max_iterations=10,
+    ),
+    "atin": lambda x, y, z: adaptive_tin_filter(
+        x, y, z, cell_size=1.0, seed_m=20.0, max_angle_deg=6.0,
+        max_dist_m=1.0, max_iterations=10,
     ),
 }
 
@@ -91,7 +101,7 @@ class MaskInvariantTests(unittest.TestCase):
         x = rng.uniform(0, 40, n)
         y = rng.uniform(0, 40, n)
         z = 400.0 + 0.05 * x + rng.uniform(-0.1, 0.1, n)
-        for name in ("pmf", "csf"):
+        for name in ("pmf", "csf", "mcc", "atin"):
             with self.subTest(method=name):
                 self.assertGreater(int(MASKS[name](x, y, z).sum()), int(n * 0.95))
 
@@ -110,7 +120,7 @@ class FamilyDiscoveryTests(unittest.TestCase):
     def test_three_method_variants(self) -> None:
         manager.discover()
         keys = [v["key"] for v in manager.list_variants(FAMILY)]
-        self.assertEqual(keys, ["csf", "pmf", "smrf"])
+        self.assertEqual(keys, ["atin", "csf", "mcc", "pmf", "smrf"])
 
     def test_base_inert_without_strategy(self) -> None:
         manager.discover()
@@ -127,6 +137,8 @@ class FamilyDiscoveryTests(unittest.TestCase):
             ("pmf", "tile_classify_ground_pmf"),
             ("csf", "tile_classify_ground_csf"),
             ("smrf", "tile_classify_ground_smrf"),
+            ("mcc", "tile_classify_ground_mcc"),
+            ("atin", "tile_classify_ground_atin"),
         ):
             caps = effective_node_caps(FAMILY, {"strategy": key})
             self.assertEqual(caps.get("tile_task").__name__, fn)
@@ -136,7 +148,7 @@ class FamilyDiscoveryTests(unittest.TestCase):
     def test_resolved_ports_identical_across_methods(self) -> None:
         from lynceus.nodes._variants import resolved_ports
 
-        for key in ("pmf", "csf", "smrf"):
+        for key in ("pmf", "csf", "smrf", "mcc", "atin"):
             self.assertEqual(
                 resolved_ports(FAMILY, {"strategy": key}), ((PC,), (PC,))
             )

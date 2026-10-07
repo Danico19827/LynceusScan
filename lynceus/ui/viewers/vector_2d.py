@@ -171,10 +171,12 @@ def _as_float(values: np.ndarray) -> np.ndarray:
 
 
 class Vector2DViewer(BaseViewer):
-    """2D view of polygonal geometries from a GeoPackage.
+    """2D view of polygon and point geometries from a GeoPackage.
 
     With numerically relevant metric columns it shows a choropleth per
-    cell with a field selector and legend; otherwise a uniform fill.
+    feature with a field selector and legend; otherwise a uniform fill.
+    Points render as discs (treetops); polygons keep the box fast path
+    when they form an axis-aligned grid, else the painter path.
     """
 
     def __init__(self, kind: str, parent=None):
@@ -516,17 +518,18 @@ class Vector2DViewer(BaseViewer):
     def _render_field(
         features, field: str | None, borders: bool = False, cancelled=None
     ):
-        """VectorFeatures of polygons -> QImage over a dark background.
+        """VectorFeatures of polygons/points -> QImage over a dark background.
 
         With a numeric field it paints a choropleth (2-98% stretch, NODATA in
         gray / uniform if there is no valid data). Without a field it uses the
         previous uniform fill. Cell borders are only stroked when ``borders``
         is set: at fit-to-view zoom with dense grids the 1-px strokes would
-        otherwise dominate the fills. Returns `(img, (vmin, vmax, n_valid))`
+        otherwise dominate the fills. Points render as filled discs with the
+        same per-feature colors. Returns `(img, (vmin, vmax, n_valid))`
         (n_valid=0 if the field is all NODATA or there is no field) or None
-        if there are no polygons.
+        if there is nothing drawable.
         """
-        from shapely.geometry import MultiPolygon, Polygon
+        from shapely.geometry import MultiPoint, MultiPolygon, Point, Polygon
 
         if features.bounds is None or features.geometries is None:
             return None
@@ -609,6 +612,7 @@ class Vector2DViewer(BaseViewer):
                 painter.fillRect(rect, painter.brush())
             return True
 
+        point_radius = 3.0
         n_drawn = 0
         for i, geom in enumerate(features.geometries):
             if (
@@ -618,11 +622,20 @@ class Vector2DViewer(BaseViewer):
             ):
                 painter.end()
                 return None
+            dots: list
+            if isinstance(geom, Point):
+                dots = [geom]
+            elif isinstance(geom, MultiPoint):
+                dots = list(geom.geoms)
+            else:
+                dots = []
             polys: list
             if isinstance(geom, Polygon):
                 polys = [geom]
             elif isinstance(geom, MultiPolygon):
                 polys = list(geom.geoms)
+            elif dots:
+                polys = []
             else:
                 continue
             if field_data is not None and not nodata_mask[i]:
@@ -637,6 +650,14 @@ class Vector2DViewer(BaseViewer):
             else:
                 painter.setBrush(FILL)
                 painter.setPen(BORDER if borders else Qt.PenStyle.NoPen)
+            for dot in dots:
+                center = to_px(dot.x, dot.y)
+                painter.drawEllipse(
+                    QRectF(center.x() - point_radius,
+                           center.y() - point_radius,
+                           point_radius * 2.0, point_radius * 2.0)
+                )
+                n_drawn += 1
             for poly in polys:
                 if _paint_box(poly):
                     n_drawn += 1

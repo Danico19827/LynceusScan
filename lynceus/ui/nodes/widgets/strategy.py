@@ -285,3 +285,9 @@ class MethodNodeItem(SelectorNodeItem):
     """Classify-style item: method selector, no file rows."""
 
     selector_title = "Method:"
+
+
+class DerivativeNodeItem(SelectorNodeItem):
+    """Derivatives-style item: derivative selector, no file rows."""
+
+    selector_title = "Derivative:"

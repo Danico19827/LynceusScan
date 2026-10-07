@@ -1,4 +1,4 @@
-# LynceusScan — beta pública (0.1.0b3)
+# LynceusScan — beta pública (0.1.0b4)
 
 > **English version:** [README.md](README.md)
 
@@ -80,6 +80,25 @@ extensiones](https://github.com/Danico19827/LynceusScan-Extensions):
 desde plantilla): un workflow de modelo de altura de dosel y un vuelo
 multiespectral SfM con NDVI — ambas solo-núcleo, listas para adaptar a
 tus propios archivos.
+
+## Alcance y límites (lee esto antes de confiar en los productos)
+
+Sin magia silenciosa: cada algoritmo documenta lo que puede y lo que no.
+
+- **Clasificar suelo** trae cuatro métodos publicados, cada uno con un
+  alcance conocido. PMF conserva por diseño objetos más anchos que su
+  ventana máxima; SMRF es por diseño para terreno llano a suave y pela
+  el relieve empinado; CSF necesita que sus iteraciones cubran el
+  relieve del tile (los defaults cubren 50 m) y no tiene post-proceso
+  por pendiente; MCC es el mejor bajo dosel denso sin retornos de
+  suelo. Fuera de su alcance un método degrada con aviso — nunca finge
+  certeza.
+- **La validación es con fixtures**: escenas sintéticas analíticas con
+  respuesta conocida más un benchmark Tipo I/II, todo en la suite
+  abierta de tests. Eso prueba fidelidad a los papers publicados, no
+  exactitud sobre tu levantamiento. La exactitud de campo es tarea QA
+  del operador — verifica contra puntos de control antes del uso
+  operativo, exactamente como exigen las normas ASPRS/USGS.
 
 ## Hazlo tuyo: escribe una extensión
 
