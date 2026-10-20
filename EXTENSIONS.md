@@ -343,6 +343,12 @@ Declare `"tile_task": "tile_<name>"` in `PROCESSING_SPECS` and read tile
 inputs the same way (`ctx` paths). Partial outputs merge in your
 `barrier_task` or a `consolidator`.
 
+Memory-heavy tile work: the admission estimate assumes 64 B per point;
+declare your real working set when you exceed it —
+`PROCESSING_SPECS["tile_weight_factor"]` (e.g. 3.0 for a KD-tree stage),
+or `"grid_bytes_per_cell"` + `"grid_resolution_keys"` for grids that
+scale with tile **area** (see §18).
+
 ### 5c. `config_schema` (Inspector form)
 
 ```python
@@ -396,6 +402,10 @@ against the engine:
   silently disables reuse for that node, forever recomputing.
 - Sidecars travel only when a glob matches their basename
   (`image.*` covers `image.meta.json`; otherwise list it explicitly).
+- Intermediate point-cloud streams switch format per run (`.laz`
+  normally, `.las` on very large runs): declare stream globs as
+  `/**/*.laz` (the engine remaps them) and never hardcode the extension
+  on the paths you receive (`ctx["intermediate_ext"]` names it).
 
 What the fingerprint covers (so you can reason about reuse): the module
 id string, the **bytes of the module source file** (editing your `.py` —
@@ -479,6 +489,11 @@ def barrier_input_txt(ctx):
   `"multispectral"` (multiband check), `"table_gpkg"` (SQLite),
   anything else (CSV branch), `"none"`/`"custom"`/`""` (no opinions —
   for product kinds the core has no branch for).
+- Queues for free: any node with `input_file_key` also gets the shared
+  file queue (multi-select Browse + *Manage queue...*, backed by
+  `lynceus/nodes/_file_queue.py`) — queued files run unattended, one
+  clean session per file, and each run receives its file as
+  `ctx["file_path"]`. Nothing to implement on your side.
 - Without `input_file_key`, a barrier runs headless on
   `ctx["file_path"]` (generic widget, no Browse). Strategy families with
   file inputs keep explicit widget registration (core edit) — plain nodes
@@ -487,7 +502,7 @@ def barrier_input_txt(ctx):
 ## 8. Strategy families (variants)
 
 For one node with switchable products/methods (like Input Raster's
-`strategy=dtm|dsm|chm` or Classify Ground's `pmf|csf|smrf`):
+`strategy=dtm|dsm|chm` or Classify Ground's `pmf|csf|smrf|mcc|atin`):
 
 - **Base**: normal node with `NODE_ID`, `INPUTS = ()`, `OUTPUTS = ()`,
   and a `strategy` field in `config_schema` (default `""`) plus
@@ -705,34 +720,52 @@ Every artifact above is hand-writable; the CLI only speeds things up:
 ## 18. Execution model (design heavy nodes around this)
 
 - **Workers, not the app**: tile and barrier tasks run in separate
-  `spawn` worker processes (pool sized to CPU count), never in the GUI
-  process. Keep tasks self-contained functions of `(tile, ctx)` /
-  `(ctx)`: **everything they touch must be picklable** (plain
-  dicts/lists/strings/numbers/paths-as-strings — no QObjects, no open
-  file handles, no lambdas, no module-level mutable caches shared with
-  the UI).
-- **Memory envelope**: the engine throttles dispatch predictively
-  (~70% of RAM over in-flight tiles) and reactively (RSS sampling
-  shrinking workers); the tiler pages per bucket under a byte budget.
-  Design for it anyway: stream files (never `read()` a whole raster
-  bigger than RAM — windowed reads arrive post-MVP; today, oversized
-  rasters fail the node with a legible error instead of swapping the
-  machine), prefer generators over materialized lists, close files
-  explicitly.
+  `spawn` worker processes (default pool: every core minus one, so the
+  GUI and the OS stay responsive; explicit counts from Preferences/CLI
+  are respected), never in the GUI process. Keep tasks self-contained
+  functions of `(tile, ctx)` / `(ctx)`: **everything they touch must be
+  picklable** (plain dicts/lists/strings/numbers/paths-as-strings — no
+  QObjects, no open file handles, no lambdas, no module-level mutable
+  caches shared with the UI).
+- **Memory envelope**: dispatch is throttled predictively against ~70% of
+  RAM — tiles are estimated from points (64 B/point × the module's
+  `tile_weight_factor`) plus their grid terms (`grid_bytes_per_cell` ×
+  cells at the resolved resolution), and barriers from their on-disk
+  inputs (× the module's `memory_factor`, default 4×; numpy-heavy
+  derivations declare 10×) — and reactively (RSS sampling shrinking
+  workers); the tiler pages per bucket under a byte budget. **Declare
+  your real working set whenever you exceed the defaults** (see §5b);
+  and design for the budget anyway: stream files, prefer generators over
+  materialized lists, close files explicitly.
+- **Bounded execution (large data)**: the engine does not silently give
+  up on oversized products — core helpers run in windows or chunks sized
+  to the memory budget and are importable for your barriers:
+  `lynceus.processing.raster` `finish_mosaic` / `stack_mosaic` /
+  `dem_mosaic` (windowed raster merges + derivatives, byte-identical to
+  the direct path, refusing honestly with a legible reason only when
+  even windowed work cannot fit) and `lynceus.processing.chunked_merge`
+  `concat_csv` / `concat_gpkg` / `stream_keyed_groups` (append/grouped
+  table merges). Bounded-mode notices the helpers record in
+  `ctx["_bounded_notes"]` reach the payload `warnings` automatically.
+  Your own merge code should follow the same shape: stream, test fit
+  first, fail legibly, never swap the machine.
 - **Failures**: any exception marks the task failed and cascades to
-  dependents; the message reaches the node in the canvas. `RuntimeError`
-  with a plain message is the convention; `MemoryError`/`KeyError`/
-  native crashes behave the same way (failed, never zombi) but test
-  them — a segfault kills only its worker.
+  dependents; the message reaches the node in the canvas and the reason
+  is persisted to the session (`error` in `provenance.json`,
+  `failure_reasons` in `session_meta.json` — the run-end report names
+  every failed node with its cause). `RuntimeError` with a plain message
+  is the convention; `MemoryError`/`KeyError`/native crashes behave the
+  same way (failed, never zombi) but test them — a segfault kills only
+  its worker.
 - **Cancel/pause**: the engine polls cancel/pause flags between tasks;
   long barriers should checkpoint to disk periodically so a cancelled
   run resumes cheaply on re-run (reuse keys on finished files).
 - **Discovery order**: `extensions/` walks sorted and recursively,
   deterministically — last registration wins for duplicate port ids
   (hence §4's single-definition rule).
-- **Large raster policy (v1)**: tiling covers point clouds; raster
-  barriers that cannot fit RAM must fail fast with a legible error
-  naming the shortfall. Windowed processing is roadmap, not v1.
+- **Headless runs**: `python -m lynceus.cli run project.lynx` drives the
+  same engine without the GUI (`validate` / `nodes list` included) —
+  handy for scripted testing.
 
 ## 19. Sandbox and capabilities (the honest policy)
 

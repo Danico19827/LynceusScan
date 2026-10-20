@@ -39,6 +39,15 @@ PROCESSING_SPECS = {
     "barrier_task": "barrier_generate_dsm",
     "input_port": "point_cloud",
     "output_ports": ("dsm_tile", "dsm_mosaic"),
+    "input_globs": ("dsm/**/*.tif",),
+    # Accumulator working set (RASTER_GRID_BYTES_PER_CELL): the tile grid
+    # scales with tile AREA at resolution, not with points.
+    "grid_bytes_per_cell": 32,
+    "grid_resolution_keys": ("resolution",),
+    # Dispatch working set in cell copies (merge + fill + smooth): the
+    # gate budgets the direct need when it fits, the window peak when
+    # it streams.
+    "merge_copies": 20.0,
     "output_files": {"dsm_mosaic": "dsm_mosaic.tif"},
     "qml": {"dsm_mosaic.tif": "dsm"},
     "config_schema": {
@@ -117,14 +126,13 @@ def get_config_defaults() -> dict:
 
 
 def tile_generate_dsm(tile: dict, ctx: dict) -> dict:
-    """Rasterize max-Z of all points for a single tile (core-masked)."""
+    """Rasterize max-Z of all points for a single tile."""
     import laspy
     import numpy as np
 
     from lynceus.processing import provenance
     from lynceus.processing.raster import (
         TileAccumulator,
-        core_mask,
         write_geotiff,
     )
     from lynceus.processing.tiler import _laz_backend
@@ -150,7 +158,7 @@ def tile_generate_dsm(tile: dict, ctx: dict) -> dict:
             x = np.asarray(chunk.x)
             y = np.asarray(chunk.y)
             z = np.asarray(chunk.z)
-            mask = core_mask(x, y, tile)
+            mask = acc.extent_mask(x, y)
             if has_withheld:
                 # Vendor-withheld points are excluded from surfaces.
                 mask = mask & ~np.asarray(chunk.withheld, dtype=bool)
@@ -168,12 +176,7 @@ def tile_generate_dsm(tile: dict, ctx: dict) -> dict:
 def barrier_generate_dsm(ctx: dict) -> dict:
     """Merge all DSM tiles, then apply hole-filling, smoothing and crop."""
     from lynceus.processing import provenance
-    from lynceus.processing.raster import (
-        fill_holes,
-        merge_geotiffs,
-        smooth_nodata,
-        write_geotiff,
-    )
+    from lynceus.processing.raster import finish_mosaic
 
     prov_doc = provenance.build_provenance(ctx, "dsm_mosaic.tif")
     from lynceus.nodes._paths import scoped_dir, scoped_file
@@ -183,29 +186,20 @@ def barrier_generate_dsm(ctx: dict) -> dict:
         raise RuntimeError("No DSM tiles generated")
     nodata = ctx.get("nodata_value", -9999.0)
     out_path = scoped_file(ctx, "dsm_mosaic.tif")
-    arr, transform, crs = merge_geotiffs(
-        paths, ctx.get("crs"), out_path, nodata=nodata, metadata=prov_doc,
-        return_array=True,
-    )
-
-    # Post-merge processing: hole-fill + smooth
+    fill_dist = 0.0
     if ctx.get("hole_fill_enabled", True):
-        max_dist = ctx.get("hole_fill_max_dist_m", 1.5)
-        if max_dist > 0:
-            resolution = ctx.get("resolution", 1.0)
-            arr = fill_holes(arr, resolution, max_dist, nodata)
-
+        fill_dist = ctx.get("hole_fill_max_dist_m", 1.5)
+    sigma = 0.0
     if ctx.get("smooth_enabled", True):
         sigma = ctx.get("smooth_sigma", 0.5)
-        if sigma > 0:
-            arr = smooth_nodata(arr, sigma, nodata)
-
-    if ctx.get("crop_to_valid", True):
-        from lynceus.processing.raster import _crop_to_valid
-
-        arr, transform = _crop_to_valid(arr, transform, nodata)
-
-    write_geotiff(out_path, arr, transform, crs=crs, nodata=nodata, metadata=prov_doc)
+    finish_mosaic(
+        paths, out_path, crs=ctx.get("crs"), nodata=nodata, metadata=prov_doc,
+        fill_dist_m=fill_dist, smooth_sigma=sigma,
+        resolution=ctx.get("resolution", 1.0),
+        crop_to_valid=ctx.get("crop_to_valid", True),
+        memory_budget_bytes=ctx.get("_raster_grid_memory_budget_bytes"),
+        notes=ctx.setdefault("_bounded_notes", []),
+    )
     return {"file": out_path, "kind": "DSM", "node": NODE_ID}
 
 

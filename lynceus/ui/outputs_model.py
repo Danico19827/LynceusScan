@@ -23,7 +23,7 @@ from pathlib import Path
 import json
 import os
 
-_RASTER_EXT = {".tif", ".tiff"}
+_RASTER_EXT = {".tif", ".tiff", ".vrt"}
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
 # No SHP: the viewer reads GPKG/GeoJSON with stdlib+shapely (no PROJ);
 # SHP support would pull the geopandas/pyogrio stack back into the GUI

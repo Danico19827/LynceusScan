@@ -120,6 +120,7 @@ def barrier_concatenate_tables(ctx: dict) -> dict:
     import csv
     from pathlib import Path
 
+    from lynceus.nodes.flow._consolidate_base import _table_headers, _table_rows
     from lynceus.processing import provenance
 
     session = Path(ctx["session_dir"])
@@ -135,35 +136,35 @@ def barrier_concatenate_tables(ctx: dict) -> dict:
         )
     out_path = Path(scoped_file(ctx, "concatenated.csv"))
 
-    rows_a, headers_a = _read_table_rows(a_path, delimiter)
-    rows_b, headers_b = _read_table_rows(b_path, delimiter)
     # Concatenation stacks schemas: the header is the union of both file
     # headers (A order, then B-only columns), so header-only inputs still
-    # produce a valid header row. Row-only keys append defensively.
+    # produce a valid header row. Rows stream file by file, never
+    # accumulating, so arbitrarily large tables concatenate.
     headers: list[str] = []
     seen: set[str] = set()
-    for key in list(headers_a) + list(headers_b):
+    for key in _table_headers(a_path, delimiter) + _table_headers(b_path, delimiter):
         if key not in seen:
             seen.add(key)
             headers.append(key)
-    for row in rows_a + rows_b:
-        for key in row:
-            if key not in seen:
-                seen.add(key)
-                headers.append(key)
 
+    total = 0
     with open(out_path, "w", newline="", encoding="utf-8") as handle:
         if headers:
             writer = csv.DictWriter(handle, fieldnames=headers,
                                     extrasaction="ignore", delimiter=delimiter)
             writer.writeheader()
-            for row in rows_a + rows_b:
-                writer.writerow({k: row.get(k, "") for k in headers})
+            for path in (a_path, b_path):
+                for row in _table_rows(path, delimiter):
+                    for key in row:
+                        if key not in seen:
+                            seen.add(key)
+                            headers.append(key)
+                    writer.writerow({k: row.get(k, "") for k in headers})
+                    total += 1
         else:
             handle.write("")
 
     provenance.write_sidecar(out_path, prov_doc, {"delimiter": delimiter})
-    total = len(rows_a) + len(rows_b)
     payload = {
         "file": str(out_path),
         "kind": "Table",

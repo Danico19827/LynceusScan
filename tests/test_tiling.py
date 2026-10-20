@@ -28,6 +28,7 @@ from lynceus.processing.tiler import (
     MEMORY_BUDGET_FLOOR_BYTES,
     LiDARTiler,
     _has_copc_vlr,
+    backfill_grid_anchor,
     default_memory_budget_bytes,
 )
 
@@ -51,6 +52,7 @@ class CacheFreshnessTests(unittest.TestCase):
         tiler.tile_size = 100.0
         tiler.buffer_m = 10.0
         tiler.max_points = 0
+        tiler.merge_floor = 0
         return tiler
 
     def _manifest(self, tmp: Path, tiler: LiDARTiler, tiles: list) -> None:
@@ -648,6 +650,307 @@ class CopcVlrTests(unittest.TestCase):
                 x = np.asarray(chunk.x)
                 self.assertGreater(len(x), 0)
                 self.assertGreater(float(np.abs(x).max()), 0.0)
+
+
+class TilerTelemetryTests(unittest.TestCase):
+    """Phase-0 throughput diagnostic: counters ride along without changing
+    a single tile byte (determinism tests above must keep passing)."""
+
+    @staticmethod
+    def _write_cloud(path: Path, count: int, span: float = 200.0) -> Path:
+        rng = np.random.default_rng(11)
+        header = laspy.LasHeader(point_format=0, version="1.2")
+        header.scales = np.array([0.01, 0.01, 0.01])
+        header.offsets = np.zeros(3)
+        record = laspy.ScaleAwarePointRecord.zeros(
+            count,
+            point_format=header.point_format,
+            scales=header.scales,
+            offsets=header.offsets,
+        )
+        record.x = rng.uniform(0, span, count)
+        record.y = rng.uniform(0, span, count)
+        record.z = np.zeros(count)
+        with laspy.open(str(path), mode="w", header=header) as writer:
+            writer.write_points(record)
+        return path
+
+    def test_telemetry_keys_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_cloud(root / "src.laz", count=20_000)
+            result = LiDARTiler(
+                source, root / "tiles", tile_size=100.0, buffer_m=0.0,
+                chunk_size=20_000,
+            ).run(cancel_flag=None)
+            tm = result.tiling_telemetry
+            self.assertEqual(
+                sorted(tm),
+                ["chunks", "close_s", "flush_count", "flush_scan_max",
+                 "flush_scan_total", "io_stall_s", "merged_supertiles",
+                 "sample_n", "sample_open_s", "sample_write_s",
+                 "writer_evictions", "writer_reopens"],
+            )
+            self.assertGreater(tm["chunks"], 0)
+            self.assertGreaterEqual(tm["flush_count"], 1)
+            self.assertGreaterEqual(tm["flush_scan_total"], tm["chunks"])
+            self.assertIsInstance(tm["io_stall_s"], float)
+
+    def test_evictions_and_reopens_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            # 400 tiles over 200x200 m at 10 m; writers capped at 2 and a
+            # tiny byte budget so tiles flush repeatedly mid-run: the LRU
+            # churns and append-reopens constantly.
+            source = self._write_cloud(root / "src.laz", count=60_000)
+            tiler = LiDARTiler(
+                source, root / "tiles", tile_size=10.0, buffer_m=0.0,
+                chunk_size=20_000, memory_budget_bytes=8_192,
+            )
+            tiler._writer_cap = 2
+            result = tiler.run(cancel_flag=None)
+            tm = result.tiling_telemetry
+            self.assertGreater(tm["writer_evictions"], 0)
+            self.assertGreater(tm["writer_reopens"], 0)
+            total = sum(t["point_count"] for t in result.tiles_generated)
+            self.assertEqual(total, 60_000)
+
+    def test_manifest_roundtrip_carries_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_cloud(root / "src.laz", count=20_000)
+            first = LiDARTiler(
+                source, root / "tiles", tile_size=100.0, buffer_m=0.0,
+                chunk_size=20_000,
+            ).run(cancel_flag=None)
+            manifest = json.loads(
+                (root / "tiles" / "tiling_manifest.json").read_text())
+            self.assertEqual(
+                manifest["tiling_telemetry"], first.tiling_telemetry)
+            second = LiDARTiler(
+                source, root / "tiles", tile_size=100.0, buffer_m=0.0,
+                chunk_size=20_000,
+            ).run(cancel_flag=None)
+            self.assertEqual(
+                second.tiling_telemetry, first.tiling_telemetry)
+
+    def test_legacy_manifest_without_telemetry_loads(self) -> None:
+        from lynceus.processing.tiler import TilingResult
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_cloud(root / "src.laz", count=5_000)
+            LiDARTiler(
+                source, root / "tiles", tile_size=100.0, buffer_m=0.0,
+                chunk_size=20_000,
+            ).run(cancel_flag=None)
+            manifest = json.loads(
+                (root / "tiles" / "tiling_manifest.json").read_text())
+            manifest.pop("tiling_telemetry", None)
+            for key in ("source_size", "source_mtime", "manifest_version"):
+                manifest.pop(key, None)
+            result = TilingResult(**manifest)
+            self.assertEqual(result.tiling_telemetry, {})
+            self.assertEqual(
+                sum(t["point_count"] for t in result.tiles_generated), 5_000)
+
+    def test_legs_file_written_with_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_cloud(root / "src.laz", count=20_000)
+            LiDARTiler(
+                source, root / "tiles", tile_size=100.0, buffer_m=0.0,
+                chunk_size=5_000,
+            ).run(cancel_flag=None)
+            lines = (root / "tiles" / "tiling_telemetry.jsonl").read_text(
+            ).splitlines()
+            self.assertGreaterEqual(len(lines), 1)
+            last = json.loads(lines[-1])
+            self.assertEqual(
+                sorted(last),
+                ["close_s", "evictions", "flushes", "io_stall_s",
+                 "leg_m_pts_s", "overall_m_pts_s", "pct", "points",
+                 "reopens", "sample_open_s", "sample_write_s", "src",
+                 "t_s", "tiles", "total"],
+            )
+            self.assertEqual(last["pct"], 100.0)
+            self.assertEqual(last["points"], last["total"])
+
+    def test_time_legs_fire_without_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_cloud(root / "src.laz", count=1_000)
+            tiler = LiDARTiler(
+                source, root / "tiles", tile_size=100.0, buffer_m=0.0,
+                chunk_size=20_000,
+            )
+            tiler._log_throughput(50, 1_000)  # init only, below milestone
+            leg_path = root / "tiles" / "tiling_telemetry.jsonl"
+            self.assertFalse(leg_path.is_file())
+            tiler._tm_log_last_t -= 61.0  # a minute passes, no new points
+            tiler._log_throughput(50, 1_000)
+            lines = leg_path.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])["pct"], 5.0)
+
+    def test_rerun_truncates_legs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_cloud(root / "src.laz", count=20_000)
+            kwargs = dict(tile_size=100.0, buffer_m=0.0, chunk_size=5_000)
+            LiDARTiler(source, root / "tiles", **kwargs).run(
+                cancel_flag=None)
+            first = (root / "tiles" / "tiling_telemetry.jsonl").read_text(
+            ).splitlines()
+            LiDARTiler(
+                source, root / "tiles", overwrite=True, **kwargs).run(
+                cancel_flag=None)
+            second = (root / "tiles" / "tiling_telemetry.jsonl").read_text(
+            ).splitlines()
+            self.assertEqual(len(first), len(second))
+
+    def test_template_headers_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_cloud(root / "src.laz", count=20_000)
+            tiler = LiDARTiler(
+                source, root / "tiles", tile_size=100.0, buffer_m=0.0,
+                chunk_size=20_000,
+            )
+            result = tiler.run(cancel_flag=None)
+            self.assertIsNotNone(tiler._tile_header_template)
+            tile = result.tiles_generated[0]
+            with laspy.open(tile["file"]) as reader:
+                header = reader.header
+                self.assertEqual(list(header.scales), [0.01, 0.01, 0.01])
+                self.assertEqual(list(header.offsets), [0.0, 0.0, 0.0])
+                self.assertEqual(
+                    header.point_count, tile["point_count"])
+
+    def test_sampler_counts_flush_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = self._write_cloud(root / "src.laz", count=60_000)
+            tiler = LiDARTiler(
+                source, root / "tiles", tile_size=10.0, buffer_m=0.0,
+                chunk_size=20_000, memory_budget_bytes=8_192,
+            )
+            tiler._writer_cap = 2
+            result = tiler.run(cancel_flag=None)
+            tm = result.tiling_telemetry
+            self.assertGreater(tm["sample_n"], 0)
+            self.assertGreaterEqual(tm["sample_open_s"], 0.0)
+            self.assertGreaterEqual(tm["sample_write_s"], 0.0)
+
+
+class TilingMessageTests(unittest.TestCase):
+    def test_rate_message_format(self) -> None:
+        from lynceus.processing.controller import _tiling_message
+
+        self.assertEqual(
+            _tiling_message(160_000_000, 1_000_000_000, 4.25),
+            "Tiling... 16% (4.2 M pts/s)",
+        )
+        self.assertEqual(
+            _tiling_message(0, 0, 0.0), "Tiling... 0% (0.0 M pts/s)")
+
+
+class GridAnchorTests(unittest.TestCase):
+    """Legacy cached manifests gain the tiling-grid anchor (B1b)."""
+
+    OX, OY = -16471674.18, 9596234.55
+
+    def _legacy(self, col: int, row: int = 0):
+        return {
+            "tile_id": "t",
+            "col": col,
+            "row": row,
+            "core_x_min": self.OX + col * 100.0,
+            "core_y_min": self.OY + row * 100.0,
+            "core_x_max": self.OX + col * 100.0 + 100.0,
+            "core_y_max": self.OY + row * 100.0 + 100.0,
+        }
+
+    def test_backfill_stamps_shared_anchor(self) -> None:
+        tiles = [self._legacy(464), self._legacy(465, 3)]
+        backfill_grid_anchor(tiles, 100.0)
+        for tile in tiles:
+            self.assertAlmostEqual(tile["grid_ox"], self.OX, places=6)
+            self.assertAlmostEqual(tile["grid_oy"], self.OY, places=6)
+
+    def test_backfill_preserves_existing_and_ignores_junk(self) -> None:
+        tiles = [self._legacy(464), {"tile_id": "x"}, "nope"]
+        tiles[0]["grid_ox"] = 1.5
+        tiles[0]["grid_oy"] = 2.5
+        backfill_grid_anchor(tiles, 100.0)
+        self.assertEqual((tiles[0]["grid_ox"], tiles[0]["grid_oy"]),
+                         (1.5, 2.5))
+        self.assertNotIn("grid_ox", tiles[1])
+        backfill_grid_anchor(tiles, 0.0)
+        backfill_grid_anchor(tiles, "junk")
+        backfill_grid_anchor([], 100.0)
+
+    def test_backfill_without_source_tiles_is_noop(self) -> None:
+        tiles = [{"tile_id": "x"}]
+        self.assertEqual(backfill_grid_anchor(tiles, 100.0), tiles)
+
+
+class StashTelemetryTests(unittest.TestCase):
+    def test_copies_single_source_legs(self) -> None:
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tiles_dir = root / "tiles"
+            tiles_dir.mkdir()
+            body = '{"pct": 10.0}\n{"pct": 20.0}\n'
+            (tiles_dir / "tiling_telemetry.jsonl").write_text(body)
+            session = root / "session"
+            session.mkdir()
+            ctrl = PipelineController()
+            ctrl._tilings = {
+                "a1b2c3d4": SimpleNamespace(output_dir=str(tiles_dir))}
+            ctrl._stash_tiling_telemetry(session)
+            self.assertEqual(
+                (session / "tiling_telemetry.jsonl").read_text(), body)
+
+    def test_multi_source_suffixes_by_iid(self) -> None:
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ctrl = PipelineController()
+            ctrl._tilings = {}
+            for iid in ("aa", "bb"):
+                tiles_dir = root / iid
+                tiles_dir.mkdir()
+                (tiles_dir / "tiling_telemetry.jsonl").write_text(
+                    f'{{"src": "{iid}"}}\n')
+                ctrl._tilings[iid] = SimpleNamespace(
+                    output_dir=str(tiles_dir))
+            session = root / "session"
+            session.mkdir()
+            ctrl._stash_tiling_telemetry(session)
+            self.assertEqual(
+                sorted(p.name for p in session.iterdir()),
+                ["tiling_telemetry_aa.jsonl", "tiling_telemetry_bb.jsonl"],
+            )
+
+    def test_missing_legs_are_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session = root / "session"
+            session.mkdir()
+            ctrl = PipelineController()
+            ctrl._tilings = {}
+            ctrl._stash_tiling_telemetry(session)  # no-op
+            from types import SimpleNamespace
+
+            empty = root / "empty"
+            empty.mkdir()
+            ctrl._tilings = {"aa": SimpleNamespace(output_dir=str(empty))}
+            ctrl._stash_tiling_telemetry(session)  # no-op, no crash
+            self.assertEqual(list(session.iterdir()), [])
 
 
 if __name__ == "__main__":

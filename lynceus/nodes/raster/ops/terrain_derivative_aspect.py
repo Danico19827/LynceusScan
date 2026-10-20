@@ -54,17 +54,10 @@ def barrier_terrain_aspect(ctx: dict) -> dict:
     """Compute Horn-1981 aspect (descent, clockwise from north)."""
     from pathlib import Path
 
-    import numpy as np
-
     from lynceus.nodes._paths import scoped_file
     from lynceus.nodes._point_source import clean_crs
     from lynceus.processing import provenance
-    from lynceus.processing.raster import (
-        _valid_bounds,
-        aspect_from_dem,
-        read_geotiff,
-        write_geotiff,
-    )
+    from lynceus.processing.raster import aspect_from_dem, dem_mosaic
 
     prov_doc = provenance.build_provenance(ctx, "aspect.tif")
     session = Path(ctx["session_dir"])
@@ -75,15 +68,24 @@ def barrier_terrain_aspect(ctx: dict) -> dict:
     )
     if not in_path.is_file():
         raise RuntimeError("Terrain Aspect needs a DTM mosaic wired to its input")
-    nodata = float(ctx.get("nodata_value", -9999.0))
     out_path = scoped_file(ctx, "aspect.tif")
 
-    arr, transform, crs_in = read_geotiff(in_path)
-    crs_out = clean_crs(ctx.get("crs")) or crs_in
-    if _valid_bounds(arr, transform, nodata) is None:
-        grid = np.full(arr.shape, nodata, dtype=np.float32)
-        write_geotiff(out_path, grid, transform, crs=crs_out, nodata=nodata,
-                      metadata=prov_doc)
+    # The file's own NODATA tag (plus NaN, always) decides validity —
+    # external DTMs tag voids their own way and must not read as ground.
+    z_factor = float(ctx.get("z_factor", 1.0))
+    _, empty = dem_mosaic(
+        in_path, out_path,
+        dem_fn=lambda arr, cx, cy: aspect_from_dem(
+            arr, cx, cy, nodata=float(ctx.get("nodata_value", -9999.0)),
+            z_factor=z_factor),
+        halo_cells=1,
+        nodata=float(ctx.get("nodata_value", -9999.0)),
+        crs_out=clean_crs(ctx.get("crs")) or None,
+        metadata=prov_doc,
+        memory_budget_bytes=ctx.get("_raster_grid_memory_budget_bytes"),
+        notes=ctx.setdefault("_bounded_notes", []),
+    )
+    if empty:
         return {
             "file": out_path,
             "kind": "Aspect",
@@ -91,10 +93,4 @@ def barrier_terrain_aspect(ctx: dict) -> dict:
             "warnings": ["DTM input has no valid data; aspect written as all-NODATA"],
         }
 
-    grid = aspect_from_dem(
-        arr.astype(np.float64), abs(transform.a), abs(transform.e),
-        nodata=nodata, z_factor=float(ctx.get("z_factor", 1.0)),
-    ).astype(np.float32)
-    write_geotiff(out_path, grid, transform, crs=crs_out, nodata=nodata,
-                  metadata=prov_doc)
     return {"file": out_path, "kind": "Aspect", "node": _FAMILY_ID}

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import psutil
 import time as _time
-from PySide6.QtCore import QEvent, QPoint, QRect, QSettings, QSize, QTimer, Qt, QUrl
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QRect, QSettings, QSize, QTimer, Qt, QUrl
 from PySide6.QtGui import (
     QAction,
     QDesktopServices,
@@ -33,18 +33,27 @@ from lynceus.plugins.registry import manager
 from lynceus.plugins.store import ConsentStore
 from lynceus.resources import resource_path
 from lynceus.processing.controller import default_output_root
+from lynceus.ui.dialogs import (
+    ask_save_discard_cancel,
+    ask_yes_no,
+    show_critical,
+    show_info,
+)
 from lynceus.ui.extensions_dialog import (
     ExtensionsDialog,
     build_ui_gate,
     build_worker_gate,
 )
-from lynceus.ui.node_library import populate_library
+from lynceus.ui.node_library import apply_library_filter, populate_library
 from lynceus.ui.settings_keys import (
     RECENT_KEY,
     RECENT_LIMIT_DEFAULT,
     RECENT_LIMIT_KEY,
     SETTINGS_APP,
     SETTINGS_ORG,
+    SPLITTER_LEFT_KEY,
+    SPLITTER_MAIN_KEY,
+    SPLITTER_RIGHT_KEY,
 )
 from lynceus.ui.start_dialog import TemplateMetaDialog, TemplatePickerDialog
 from lynceus.ui.translate import language_changed, translate_widget
@@ -77,12 +86,17 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("LynceusScan")
         self._init_status_dot()
         self._init_runs_panel()
-        populate_library(self.libraryNodes)
+        self._init_library_search()
+        self._refresh_library()
         self.libraryNodes.node_add_requested.connect(self.canvasView.add_node)
         self.canvasView.message_requested.connect(self._on_status_message)
         self.canvasView.node_selected.connect(self.inspectorPanel.set_node)
+        self.canvasView.nodes_selected.connect(self.inspectorPanel.set_multi)
         self.inspectorPanel.config_changed.connect(
             self.canvasView.on_config_changed
+        )
+        self.inspectorPanel.bulk_action_requested.connect(
+            self._on_inspector_bulk_action
         )
         self.inspectorPanel.strategy_change_requested.connect(
             self.canvasView.on_strategy_requested
@@ -95,9 +109,13 @@ class MainWindow(QMainWindow):
             self.outputDock.set_products
         )
         self.canvasView.node_preview_requested.connect(self._on_node_preview)
+        self.canvasView.open_preferences_requested.connect(
+            self.show_preferences
+        )
         self._connect_view_actions()
         self._init_project_state()
         self._connect_project_actions()
+        self._install_edit_menu()
         self._install_extensions_menu()
         self._install_template_actions()
         self._install_preview_action()
@@ -139,6 +157,7 @@ class MainWindow(QMainWindow):
             left_splitter.setStretchFactor(0, 3)
             left_splitter.setStretchFactor(1, 2)
             left_splitter.setSizes([320, 220])
+        self._restore_splitter_states()
 
         self._dragging_window = False
         self._drag_offset = QPoint()
@@ -189,11 +208,70 @@ class MainWindow(QMainWindow):
         self._apply_text_direction(locale_manager.language)
         language_changed.emit(locale_manager.language)
 
+    def _init_library_search(self) -> None:
+        """Search box above the node tree (placeholder follows the catalog)."""
+        search = getattr(self, "librarySearch", None)
+        if search is None:
+            return
+        search.setProperty("origPh_en", "Search nodes...")
+        search.setPlaceholderText(t("Search nodes..."))
+        search.textChanged.connect(self._on_library_search_text)
+
+    def _on_library_search_text(self, text: str) -> None:
+        apply_library_filter(self.libraryNodes, text)
+
+    def _refresh_library(self) -> None:
+        """Repopulate the tree, keeping the current search filter applied."""
+        populate_library(self.libraryNodes)
+        search = getattr(self, "librarySearch", None)
+        text = search.text() if search is not None else ""
+        apply_library_filter(self.libraryNodes, text)
+
+    def _restore_splitter_states(self) -> None:
+        """Restore persisted splitter layouts over the coded defaults."""
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        for name, key in (
+            ("splitter", SPLITTER_MAIN_KEY),
+            ("nodesLeftSplitter", SPLITTER_LEFT_KEY),
+            ("rightSplitter", SPLITTER_RIGHT_KEY),
+        ):
+            splitter = getattr(self, name, None)
+            if splitter is None:
+                continue
+            try:
+                raw = settings.value(key)
+            except Exception:
+                continue
+            if not isinstance(raw, QByteArray) or raw.isEmpty():
+                continue
+            try:
+                restored = splitter.restoreState(raw)
+            except Exception:
+                continue
+            if restored and key == SPLITTER_RIGHT_KEY:
+                # A restored layout wins over the deferred 50/50 init.
+                self._right_split_init_done = True
+
+    def _save_splitter_states(self) -> None:
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        for name, key in (
+            ("splitter", SPLITTER_MAIN_KEY),
+            ("nodesLeftSplitter", SPLITTER_LEFT_KEY),
+            ("rightSplitter", SPLITTER_RIGHT_KEY),
+        ):
+            splitter = getattr(self, name, None)
+            if splitter is None:
+                continue
+            try:
+                settings.setValue(key, splitter.saveState())
+            except Exception:
+                continue
+
     def _on_language_changed(self, _code: str) -> None:
         # Rebuilds first (fresh English text), then a single translate pass
         # over the whole tree using origText_en, so switching back to English
         # really reverts everything.
-        populate_library(self.libraryNodes)
+        self._refresh_library()
         self.canvasView.retranslate_items()
         self.inspectorPanel.refresh()
         translate_widget(self)
@@ -222,7 +300,7 @@ class MainWindow(QMainWindow):
                 THEME_KEY, THEME_DEFAULT
             )
             apply_theme(THEME_DEFAULT)
-        populate_library(self.libraryNodes)
+        self._refresh_library()
         self.canvasView.refresh_node_availability()
 
     # ---------- View menu actions ----------
@@ -247,12 +325,77 @@ class MainWindow(QMainWindow):
             zoom_action.setShortcut(QKeySequence("Ctrl+1"))
         zoom_action.triggered.connect(self.canvasView.set_zoom_100)
 
+    # ---------- Edit menu (fleet operations) ----------
+
+    def _install_edit_menu(self) -> None:
+        """Insert the Edit menu between File and View.
+
+        Actions carry no ``setShortcut``: the canvas owns the keyboard
+        shortcuts (window-scoped, guarded while editing text), so a single
+        binding stays authoritative and text fields keep their clipboard.
+        """
+        menubar = self.menuBar()
+        edit = QMenu(t("Edit"), self)
+        edit.menuAction().setProperty("origText_en", "Edit")
+
+        self.actionUndo = edit.addAction(t("Undo"))
+        self.actionUndo.setProperty("origText_en", "Undo")
+        self.actionUndo.triggered.connect(self.canvasView.undo)
+        self.actionRedo = edit.addAction(t("Redo"))
+        self.actionRedo.setProperty("origText_en", "Redo")
+        self.actionRedo.triggered.connect(self.canvasView.redo)
+        self.canvasView.history_changed.connect(self._on_history_changed)
+        self.canvasView.history_applied.connect(self._refresh_dirty_from_document)
+        self._on_history_changed(
+            self.canvasView.can_undo(), self.canvasView.can_redo()
+        )
+        edit.addSeparator()
+
+        cut = edit.addAction(t("Cut"))
+        cut.setProperty("origText_en", "Cut")
+        cut.triggered.connect(self.canvasView.cut_selection)
+        copy = edit.addAction(t("Copy"))
+        copy.setProperty("origText_en", "Copy")
+        copy.triggered.connect(self.canvasView.copy_selection)
+        paste = edit.addAction(t("Paste"))
+        paste.setProperty("origText_en", "Paste")
+        paste.triggered.connect(self.canvasView.paste)
+        edit.addSeparator()
+        duplicate = edit.addAction(t("Duplicate"))
+        duplicate.setProperty("origText_en", "Duplicate")
+        duplicate.triggered.connect(self.canvasView.duplicate)
+        select_all = edit.addAction(t("Select All"))
+        select_all.setProperty("origText_en", "Select All")
+        select_all.triggered.connect(self.canvasView.select_all)
+        edit.addSeparator()
+        delete = edit.addAction(t("Delete"))
+        delete.setProperty("origText_en", "Delete")
+        delete.triggered.connect(self.canvasView.delete_selected)
+
+        file_menu = getattr(self, "fileMenu", None)
+        if file_menu is not None:
+            menubar.insertMenu(file_menu.menuAction(), edit)
+        else:
+            menubar.addMenu(edit)
+
+    def _on_inspector_bulk_action(self, action: str) -> None:
+        """Batch buttons from the multi-selection Inspector panel."""
+        if action == "assign_files":
+            self.canvasView.assign_files_to_selection()
+        elif action == "delete":
+            self.canvasView.delete_selected()
+
+    def _on_history_changed(self, can_undo: bool, can_redo: bool) -> None:
+        self.actionUndo.setEnabled(can_undo)
+        self.actionRedo.setEnabled(can_redo)
+
     # ---------- project (state and File menu actions) ----------
 
     def _init_project_state(self) -> None:
         self._project_path: str | None = None
         self._template_name: str | None = None
         self._dirty = False
+        self._saved_snapshot = self.canvasView.document_snapshot()
         self._recent_paths = self._load_recent()
         self._recent_menu: QMenu | None = None
         self.canvasView.graph_changed.connect(self._on_graph_changed)
@@ -358,7 +501,7 @@ class MainWindow(QMainWindow):
         from lynceus.ui.outputs_model import viewer_for_path
 
         preview_filter = (
-            "Point Cloud (*.las *.laz);;Raster (*.tif *.tiff);;"
+            "Point Cloud (*.las *.laz);;Raster (*.tif *.tiff *.vrt);;"
             "Vector (*.gpkg *.shp *.geojson);;Table (*.csv *.txt);;"
             "JSON (*.json);;All Files (*)"
         )
@@ -379,7 +522,7 @@ class MainWindow(QMainWindow):
 
     def new_from_template(self) -> None:
         if self.canvasView.is_run_active():
-            QMessageBox.information(
+            show_info(
                 self, t("Run in progress"),
                 t("Cancel or wait for the current run before opening a template."),
             )
@@ -388,7 +531,7 @@ class MainWindow(QMainWindow):
             return
         infos = templates_io.list_templates()
         if not [i for i in infos if i.valid]:
-            QMessageBox.information(
+            show_info(
                 self,
                 t("New From Template"),
                 t(
@@ -422,18 +565,16 @@ class MainWindow(QMainWindow):
             / templates_io.template_file_name(meta["name"])
         )
         if dest.exists():
-            ret = QMessageBox.question(
+            if not ask_yes_no(
                 self,
                 t("Save as Template"),
                 t("A template with this name already exists. Overwrite it?"),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
+            ):
                 return False
         try:
             project_io.save_project(dest, doc)
         except OSError as exc:
-            QMessageBox.critical(
+            show_critical(
                 self,
                 t("Save as Template"),
                 t("Could not save template: {exc}").format(exc=exc),
@@ -519,7 +660,7 @@ class MainWindow(QMainWindow):
             QIcon(tint_pixmap(pixmap, QColor(THEME_COLORS["text"])))
         )
 
-    def show_preferences(self) -> None:
+    def show_preferences(self, section: str | None = None) -> None:
         from lynceus.ui.fonts import saved_size
         from lynceus.ui.preferences_dialog import PreferencesDialog
         from lynceus.ui.settings_keys import (
@@ -551,6 +692,8 @@ class MainWindow(QMainWindow):
         dialog = PreferencesDialog(
             self, on_apply=lambda: self._apply_prefs_changes(baseline)
         )
+        if section:
+            dialog.select_section(section)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._apply_prefs_changes(baseline)
@@ -612,6 +755,16 @@ class MainWindow(QMainWindow):
     def _on_graph_changed(self) -> None:
         self._set_dirty(True)
 
+    def _refresh_dirty_from_document(self) -> None:
+        """Dirty by comparison with the last saved snapshot (item 9).
+
+        Re-computed after undo/redo: reversing back to the saved state clears
+        the asterisk; any other real mutation keeps it set (cheap path).
+        """
+        self._set_dirty(
+            self.canvasView.document_snapshot() != self._saved_snapshot
+        )
+
     def _set_dirty(self, dirty: bool) -> None:
         if self._dirty == dirty:
             return
@@ -630,7 +783,7 @@ class MainWindow(QMainWindow):
 
     def new_project(self) -> None:
         if self.canvasView.is_run_active():
-            QMessageBox.information(
+            show_info(
                 self, t("Run in progress"),
                 t("Cancel or wait for the current run before starting a new project."),
             )
@@ -638,14 +791,16 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         self.canvasView.clear_graph()
+        self.canvasView.clear_history()
         self._project_path = None
         self._template_name = None
         self._sync_session_root()
+        self._saved_snapshot = self.canvasView.document_snapshot()
         self._set_dirty(False)
 
     def open_project(self) -> None:
         if self.canvasView.is_run_active():
-            QMessageBox.information(
+            show_info(
                 self, t("Run in progress"),
                 t("Cancel or wait for the current run before opening a project."),
             )
@@ -668,10 +823,10 @@ class MainWindow(QMainWindow):
             data = project_io.load_project(path)
             missing = project_io.validate_nodes(data)
         except project_io.ProjectError as exc:
-            QMessageBox.critical(self, t("Open Project"), str(exc))
+            show_critical(self, t("Open Project"), str(exc))
             return
         if missing:
-            QMessageBox.information(
+            show_info(
                 self,
                 t("Open Project"),
                 t(
@@ -681,6 +836,52 @@ class MainWindow(QMainWindow):
                     "the node(s)."
                 ).format(names=", ".join(missing)),
             )
+        open_warnings: list[str] = []
+        template_missing: list[str] = []
+        if from_template:
+            # Item 45: a template on a different machine may reference files
+            # that do not exist here. Keep the surviving paths; empty the
+            # vanished ones so the nodes open clean, and report them in one
+            # non-blocking notice.
+            try:
+                _existing, template_missing = templates_io.partition_template_files(
+                    data
+                )
+            except Exception as exc:  # best-effort: open with original refs
+                open_warnings.append(
+                    t("Skipped template file check: {exc}").format(exc=exc)
+                )
+                template_missing = []
+            else:
+                if template_missing:
+                    try:
+                        templates_io.strip_missing_files(
+                            data, set(template_missing)
+                        )
+                    except Exception as exc:  # best-effort, same as above
+                        open_warnings.append(
+                            t("Skipped template file check: {exc}").format(
+                                exc=exc
+                            )
+                        )
+                        template_missing = []
+        # Atomic open: snapshot the live canvas first. If the restore blows
+        # up on input the validator did not catch, the user keeps their
+        # current work and gets an error instead of a cleared canvas + crash.
+        previous = self.canvasView.serialize_graph()
+        try:
+            warnings = self.canvasView.restore_graph(data)
+        except Exception as exc:
+            try:
+                self.canvasView.restore_graph(previous)
+            except Exception:
+                self.canvasView.clear_graph()
+            show_critical(
+                self,
+                t("Open Project"),
+                t("Could not open project: {exc}").format(exc=exc),
+            )
+            return
         warnings = self.canvasView.restore_graph(data)
         if from_template:
             # Untitled copy: the template file itself is never overwritten;
@@ -695,10 +896,22 @@ class MainWindow(QMainWindow):
             self._template_name = None
             self._add_recent(self._project_path)
         self._sync_session_root()
+        self._saved_snapshot = self.canvasView.document_snapshot()
+        self.canvasView.clear_history()
         self._set_dirty(False)
-        if warnings:
+        all_warnings = open_warnings + warnings
+        if all_warnings:
             self._on_status_message(
-                " | ".join(t(w) for w in warnings), "warning"
+                " | ".join(t(w) for w in all_warnings), "warning"
+            )
+        if from_template and template_missing:
+            names = ", ".join(Path(p).name for p in template_missing)
+            self.canvasView.post_notice(
+                t(
+                    "Template references {n} file(s) not found on this "
+                    "machine: {names} — set them again in their nodes"
+                ).format(n=len(template_missing), names=names),
+                "warning",
             )
 
     def save_project(self) -> bool:
@@ -706,6 +919,7 @@ class MainWindow(QMainWindow):
             return self.save_project_as()
         if not self._write_project(self._project_path):
             return False
+        self._saved_snapshot = self.canvasView.document_snapshot()
         self._set_dirty(False)
         self._add_recent(self._project_path)
         return True
@@ -729,6 +943,7 @@ class MainWindow(QMainWindow):
         self._project_path = str(Path(path).resolve())
         self._template_name = None
         self._sync_session_root()
+        self._saved_snapshot = self.canvasView.document_snapshot()
         self._set_dirty(False)
         self._add_recent(self._project_path)
         return True
@@ -753,7 +968,7 @@ class MainWindow(QMainWindow):
         try:
             project_io.save_project(path, data)
         except OSError as exc:
-            QMessageBox.critical(
+            show_critical(
                 self,
                 t("Save Project"),
                 t("Could not save project: {exc}").format(exc=exc),
@@ -765,13 +980,10 @@ class MainWindow(QMainWindow):
         """True if we can continue (no changes, saved or discarded)."""
         if not self._dirty:
             return True
-        ret = QMessageBox.warning(
+        ret = ask_save_discard_cancel(
             self,
             t("Unsaved Changes"),
             t("The project has unsaved changes. Save them?"),
-            QMessageBox.StandardButton.Save
-            | QMessageBox.StandardButton.Discard
-            | QMessageBox.StandardButton.Cancel,
         )
         if ret == QMessageBox.StandardButton.Save:
             return self.save_project()
@@ -785,6 +997,7 @@ class MainWindow(QMainWindow):
         shutdown = getattr(runs, "shutdown", None)
         if callable(shutdown):
             shutdown()
+        self._save_splitter_states()
         super().closeEvent(event)
 
     # ---------- project: sessions by folder ----------

@@ -959,4 +959,25 @@ def run_file_node_task(module_id: str, fn_name: str, args):
     """
     module = manager.import_node(module_id)
     fn = getattr(module, fn_name)
-    return fn(*args)
+    result = fn(*args)
+    notes: list = []
+    stack = list(args)
+    while stack and not notes:
+        value = stack.pop()
+        if isinstance(value, dict):
+            try:
+                found = value.pop("_bounded_notes", [])
+            except AttributeError:
+                continue
+            if found:
+                notes = list(found)
+        elif isinstance(value, (list, tuple)):
+            stack.extend(value)
+    if notes and isinstance(result, dict):
+        # Same drain as core barriers (lazy import: steps imports
+        # this module at top level).
+        from lynceus.processing.steps import _forward_bounded_notes
+
+        return _forward_bounded_notes(
+            result, {"_bounded_notes": notes})
+    return result

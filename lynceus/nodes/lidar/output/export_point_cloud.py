@@ -34,7 +34,10 @@ PROCESSING_SPECS = {
     "input_port": "point_cloud",
     "output_port": "point_cloud",
     "point_cloud_export": True,
-    "output_globs": ("point_cloud_exports/*/point_cloud_consolidated.laz",),
+    "output_globs": (
+        "point_cloud_exports/*/point_cloud_consolidated.laz",
+        "point_cloud_consolidated*.laz",
+    ),
     "config_schema": {
         "stage_name": {
             "type": "str",
@@ -109,12 +112,22 @@ def barrier_export_point_cloud(ctx: dict) -> dict:
     from lynceus.processing.tiler import _laz_backend
 
     node_iid = str(ctx.get("node_iid") or "export")
-    output_path = (
-        Path(ctx["session_dir"])
-        / "point_cloud_exports"
-        / node_iid
-        / "point_cloud_consolidated.laz"
-    )
+    # Finals-only sessions write the export flat at the artifacts root
+    # (preassigned per graph, deterministic); otherwise the legacy nested
+    # layout applies. The payload carries the real path, so gallery,
+    # provenance and reuse follow without path surgery.
+    flat_name = Path(
+        str((ctx.get("export_filenames") or {}).get(node_iid) or "")
+    ).name
+    if flat_name:
+        output_path = Path(ctx["session_dir"]) / flat_name
+    else:
+        output_path = (
+            Path(ctx["session_dir"])
+            / "point_cloud_exports"
+            / node_iid
+            / "point_cloud_consolidated.laz"
+        )
     crop_buffer = bool(ctx.get("crop_buffer", True))
     display_name = str(ctx.get("stage_name") or "")
     if output_path.exists():

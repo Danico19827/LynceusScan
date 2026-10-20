@@ -249,6 +249,99 @@ QDoubleSpinBox::down-button {
     border-bottom-right-radius: 3px;
 }
 
+/* ---------- Buttons (global) ---------- */
+/* Without this rule, buttons fall back to the native style: the face comes
+   from the OS theme while the text comes from the palette's light text —
+   white-on-white on light Windows (same class as the text-field rule
+   above). Covers QDialogButtonBox buttons too (they are QPushButtons). */
+QPushButton {
+    background-color: #1c2333;
+    color: #e6e9f0;
+    border: 1px solid #3a465c;
+    border-radius: 4px;
+    padding: 4px 12px;
+}
+
+QPushButton:hover {
+    background-color: #2f3a4f;
+}
+
+QPushButton:pressed {
+    background-color: #0b0f1a;
+}
+
+QPushButton:focus {
+    border-color: #7d9fd4;
+}
+
+QPushButton:disabled {
+    color: #8a93a6;
+}
+
+QPushButton:default {
+    border-color: #7d9fd4;
+}
+
+/* ---------- Checkboxes, lists, sliders (global) ---------- */
+/* Same native-face exposure as buttons: face and text must both come from
+   the theme. The checkbox indicator keeps its native box (readable on any
+   OS theme); only the label color is pinned. */
+QCheckBox {
+    color: #e6e9f0;
+    spacing: 6px;
+}
+
+QCheckBox:disabled {
+    color: #8a93a6;
+}
+
+QListWidget {
+    background-color: #0b0f1a;
+    color: #e6e9f0;
+    border: 1px solid #2f3a4f;
+    border-radius: 4px;
+    outline: none;
+}
+
+QListWidget::item {
+    padding: 2px 4px;
+}
+
+QListWidget::item:hover {
+    background-color: #2f3a4f;
+}
+
+QListWidget::item:selected {
+    background-color: #2f3a4f;
+    color: #7d9fd4;
+}
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background-color: #2f3a4f;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    width: 12px;
+    margin: -4px 0;
+    border-radius: 6px;
+    background-color: #7d9fd4;
+}
+
+QSlider::groove:vertical {
+    width: 4px;
+    background-color: #2f3a4f;
+    border-radius: 2px;
+}
+
+QSlider::handle:vertical {
+    height: 12px;
+    margin: 0 -4px;
+    border-radius: 6px;
+    background-color: #7d9fd4;
+}
+
 QWidget#inspectorPanel QComboBox {
     background-color: #0b0f1a;
     color: #e6e9f0;
@@ -311,6 +404,29 @@ QLabel#viewerPlaceholder {
     background-color: #1c2333;
 }
 
+/* Viewer help button: the global QPushButton padding (12px sides) leaves
+   zero content width on a 24px square, hiding the "?". Tight padding here
+   gives the glyph room without touching the global rule. */
+QPushButton#viewerHelpButton {
+    padding: 2px 4px;
+}
+
+/* Floating classification legend over the 3D viewport: solid surface
+   background (a fixed rgba can never follow themes), theme-mapped like
+   every other hex in this sheet. */
+QWidget#pointCloudLegend {
+    background-color: #1c2333;
+    border: 1px solid #3a465c;
+    border-radius: 6px;
+}
+
+QWidget#pointCloudLegend QLabel {
+    color: #e6e9f0;
+    font-size: 11px;
+    background-color: transparent;
+    border: none;
+}
+
 QLabel#inspectorGroupHeader {
     color: #7d9fd4;
     font-size: 11px;
@@ -355,6 +471,65 @@ QLabel#panelHint {
     background-color: transparent;
 }
 
+/* ---------- Extension rows (cards) ---------- */
+/* One calm card per extension: two text lines, a status dot and ghost
+   actions. All hexes follow the theme map (dots reuse the canvas-chip
+   semantic colors, proven across every shipped theme). */
+QWidget#extRow {
+    background-color: #1c2333;
+    border: 1px solid #2f3a4f;
+    border-radius: 6px;
+}
+
+QLabel#extName {
+    color: #e6e9f0;
+    font-size: 13px;
+    font-weight: 600;
+    background-color: transparent;
+    border: none;
+}
+
+QLabel#extMeta,
+QLabel#extDetail {
+    color: #8a93a6;
+    font-size: 11px;
+    background-color: transparent;
+    border: none;
+}
+
+QLabel#statusDot {
+    border-radius: 4px;
+}
+
+QLabel#statusDot[extState="ok"] {
+    background-color: #7ec4a1;
+}
+
+QLabel#statusDot[extState="pending"] {
+    background-color: #c9a86a;
+}
+
+QLabel#statusDot[extState="disabled"] {
+    background-color: #8a93a6;
+}
+
+QPushButton#extOverflow {
+    background-color: transparent;
+    border: none;
+    color: #8a93a6;
+    padding: 2px 4px;
+}
+
+QPushButton#extOverflow:hover {
+    background-color: #2f3a4f;
+    color: #e6e9f0;
+}
+
+QLabel#hintLabel {
+    color: #8a93a6;
+    background-color: transparent;
+}
+
 QTreeWidget#outputsTree {
     background-color: #1c2333;
     color: #e6e9f0;
@@ -365,7 +540,7 @@ QTreeWidget#outputsTree {
 }
 
 QTreeWidget#outputsTree::item {
-    padding: 3px 4px;
+    padding: 5px 6px;
 }
 
 QTreeWidget#outputsTree::item:hover {
@@ -373,8 +548,8 @@ QTreeWidget#outputsTree::item:hover {
 }
 
 QTreeWidget#outputsTree::item:selected {
-    background-color: #3a465c;
-    color: #e6e9f0;
+    background-color: #2f3a4f;
+    color: #7d9fd4;
 }
 
 QTreeWidget#outputsTree QHeaderView::section {
@@ -467,7 +642,7 @@ QTreeWidget#libraryNodes {
 }
 
 QTreeWidget#libraryNodes::item {
-    padding: 5px 4px 5px 10px;
+    padding: 5px 6px 5px 10px;
 }
 
 QTreeWidget#libraryNodes::item:hover {
@@ -475,8 +650,13 @@ QTreeWidget#libraryNodes::item:hover {
 }
 
 QTreeWidget#libraryNodes::item:selected {
-    background-color: #3a465c;
-    color: #e6e9f0;
+    background-color: #2f3a4f;
+    color: #7d9fd4;
+}
+
+QLineEdit#librarySearch {
+    border-radius: 6px;
+    padding: 5px 10px;
 }
 
 QTreeWidget#libraryNodes QHeaderView::section {
@@ -646,16 +826,16 @@ QToolButton#menuLogo:hover {
 QWidget#canvasToolbar {
     background-color: #1c2333;
     border: 1.2px solid #2f3a4f;
-    border-radius: 6px;
+    border-radius: 10px;
 }
 
 QWidget#canvasToolbar QToolButton {
     background: transparent;
     border: none;
-    border-radius: 4px;
+    border-radius: 6px;
     color: #8a93a6;
     font-size: 12px;
-    padding: 4px 8px;
+    padding: 6px 10px;
 }
 
 QWidget#canvasToolbar QToolButton:hover {
@@ -684,7 +864,8 @@ QWidget#canvasToolbar QToolButton#btnRun {
 }
 
 QWidget#canvasToolbar QToolButton#btnRun:hover {
-    background-color: #7d9fd4;
+    background-color: #3a465c;
+    color: #e6e9f0;
 }
 
 QWidget#canvasToolbar QToolButton#btnRun:disabled {
@@ -697,6 +878,26 @@ QLabel#zoomLabel {
     color: #8a93a6;
     font-size: 11px;
     min-width: 36px;
+    background-color: #0b0f1a;
+    border-radius: 4px;
+    padding: 3px 4px;
+}
+
+QWidget#canvasToolbar QToolButton#btnCancel:hover {
+    color: #e08a8a;
+}
+
+QWidget#canvasToolbar QToolButton#btnCollapse,
+QWidget#canvasToolbar QToolButton#btnExpand {
+    border-radius: 12px;
+    padding: 2px;
+    color: #8a93a6;
+}
+
+QWidget#canvasToolbar QToolButton#btnCollapse:hover,
+QWidget#canvasToolbar QToolButton#btnExpand:hover {
+    background-color: #2f3a4f;
+    color: #e6e9f0;
 }
 
 QLabel#canvasStatusChip {
@@ -742,6 +943,46 @@ QFrame#noticeTray QToolButton#noticeDismiss:hover {
     color: #e6e9f0;
     background-color: #2f3a4f;
     border-radius: 6px;
+}
+
+/* Notice rows: kind colors mirror NOTICE_KIND_COLORS (semantic, readable
+   on every shipped theme like the canvas chips). */
+QFrame#noticeRow QLabel#noticeDot {
+    border-radius: 4px;
+}
+
+QFrame#noticeRow[noticeKind="info"] QLabel#noticeDot {
+    background-color: #7aa8d4;
+}
+
+QFrame#noticeRow[noticeKind="info"] QLabel#noticeText {
+    color: #7aa8d4;
+}
+
+QFrame#noticeRow[noticeKind="action"] QLabel#noticeDot,
+QFrame#noticeRow[noticeKind="warning"] QLabel#noticeDot {
+    background-color: #d4a94e;
+}
+
+QFrame#noticeRow[noticeKind="action"] QLabel#noticeText,
+QFrame#noticeRow[noticeKind="warning"] QLabel#noticeText {
+    color: #d4a94e;
+}
+
+QFrame#noticeRow[noticeKind="success"] QLabel#noticeDot {
+    background-color: #6ec87a;
+}
+
+QFrame#noticeRow[noticeKind="success"] QLabel#noticeText {
+    color: #6ec87a;
+}
+
+QFrame#noticeRow[noticeKind="error"] QLabel#noticeDot {
+    background-color: #d46a6a;
+}
+
+QFrame#noticeRow[noticeKind="error"] QLabel#noticeText {
+    color: #d46a6a;
 }
 
 QLabel#noticeSummary {
@@ -852,7 +1093,7 @@ QTreeWidget#runsTree {
 }
 
 QTreeWidget#runsTree::item {
-    padding: 4px 4px 4px 10px;
+    padding: 5px 6px 5px 10px;
 }
 
 QTreeWidget#runsTree::item:hover {
@@ -860,6 +1101,173 @@ QTreeWidget#runsTree::item:hover {
 }
 
 QTreeWidget#runsTree::item:selected {
+    background-color: #2f3a4f;
+    color: #7d9fd4;
+}
+
+/* ---------- Launcher (start dialog) ---------- */
+QLabel#startTitle {
+    color: #e6e9f0;
+    font-size: 20px;
+    font-weight: 600;
+}
+
+QLabel#startSubtitle {
+    color: #8a93a6;
+    font-size: 12px;
+}
+
+QLabel#startSection {
+    color: #7d9fd4;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+QListWidget#recentList,
+QListWidget#templateList {
+    background-color: #1c2333;
+    border: 1px solid #2f3a4f;
+    border-radius: 6px;
+    outline: none;
+    font-size: 12px;
+}
+
+QListWidget#recentList::item,
+QListWidget#templateList::item {
+    padding: 6px 8px;
+    border-radius: 4px;
+}
+
+QListWidget#recentList::item:hover,
+QListWidget#templateList::item:hover {
+    background-color: #2f3a4f;
+}
+
+QListWidget#recentList::item:selected,
+QListWidget#templateList::item:selected {
+    background-color: #2f3a4f;
+    color: #7d9fd4;
+    border-left: 2px solid #7d9fd4;
+}
+
+QTextEdit#templateDetails {
+    background-color: #1c2333;
+    color: #aeb7c6;
+    border: 1px solid #2f3a4f;
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 12px;
+}
+
+QPushButton#startPrimary {
+    background-color: #7d9fd4;
+    color: #0b0f1a;
+    font-weight: 600;
+    border-radius: 6px;
+    padding: 8px 16px;
+}
+
+QPushButton#startPrimary:hover {
     background-color: #3a465c;
     color: #e6e9f0;
+}
+
+QPushButton#startPrimary:disabled {
+    background-color: #1f2740;
+    color: #8a93a6;
+    font-weight: 500;
+}
+
+/* ---------- Tooltips (global) ---------- */
+/* Native tooltips render in the OS face (white on Windows): unreadable
+   against the dark canvas. One theme-mapped rule dresses them all. */
+QToolTip {
+    background-color: #1c2333;
+    color: #e6e9f0;
+    border: 1px solid #3a465c;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+/* ---------- Viewer chrome ---------- */
+QLabel#viewerInfo {
+    color: #8a93a6;
+    font-size: 11px;
+}
+
+QLabel#viewerLegendText {
+    color: #aeb7c6;
+    font-size: 11px;
+}
+
+QProgressBar#previewLoadingProgress {
+    background-color: transparent;
+    border: none;
+    max-height: 4px;
+    text-align: center;
+}
+
+QProgressBar#previewLoadingProgress::chunk {
+    background-color: #7d9fd4;
+    border-radius: 2px;
+}
+
+/* ---------- Pre-flight advisor cards ---------- */
+QLabel#preflightHeadline {
+    color: #e6e9f0;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QWidget#preflightCard {
+    background-color: #1c2333;
+    border: 1px solid #2f3a4f;
+    border-radius: 6px;
+}
+
+QWidget#preflightCard QLabel {
+    background-color: transparent;
+}
+
+/* ---------- Queue + assign dialogs ---------- */
+QListWidget#queueList,
+QTableWidget#assignTable {
+    background-color: #1c2333;
+    border: 1px solid #2f3a4f;
+    border-radius: 6px;
+    outline: none;
+    font-size: 12px;
+}
+
+QListWidget#queueList::item {
+    padding: 5px 8px;
+    border-radius: 4px;
+}
+
+QListWidget#queueList::item:hover {
+    background-color: #2f3a4f;
+}
+
+QListWidget#queueList::item:selected {
+    background-color: #2f3a4f;
+    color: #7d9fd4;
+}
+
+QTableWidget#assignTable {
+    color: #e6e9f0;
+    gridline-color: #2f3a4f;
+}
+
+QTableWidget#assignTable QHeaderView::section {
+    background-color: #0b0f1a;
+    color: #8a93a6;
+    border: none;
+    border-bottom: 1px solid #2f3a4f;
+    padding: 3px 6px;
+    font-size: 11px;
+}
+
+QLabel#assignWarning {
+    color: #c9a86a;
 }

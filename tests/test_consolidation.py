@@ -19,6 +19,7 @@ from lynceus.processing.steps import (
     build_dag,
     discover_node_capabilities,
     effective_node_caps,
+    prune_nodes,
 )
 
 LOAD = "lynceus.nodes.lidar.source.load_las_laz"
@@ -693,6 +694,46 @@ class ConsolidateProvenanceTests(unittest.TestCase):
                 )
             )
             self.assertEqual(sidecar["metrics_computed"], ["density"])
+
+
+class MergeSegmentsFlagTests(unittest.TestCase):
+    def test_merge_defaults_to_true(self) -> None:
+        ctrl = PipelineController()
+        self.assertTrue(ctrl._resolve_merge_segments({}, ["loader"]))
+
+    def test_loader_flag_disables_merge(self) -> None:
+        ctrl = PipelineController()
+        self.assertFalse(ctrl._resolve_merge_segments(
+            {"loader": {"merge_segments": False}}, ["loader"]))
+
+    def test_non_trigger_nodes_cannot_disable_merge(self) -> None:
+        ctrl = PipelineController()
+        self.assertTrue(ctrl._resolve_merge_segments(
+            {"dtm": {"merge_segments": False}}, ["loader"]))
+
+    def test_empty_triggers_default_to_true(self) -> None:
+        ctrl = PipelineController()
+        self.assertTrue(ctrl._resolve_merge_segments({}, []))
+
+
+class PruneConsolidatorsTests(unittest.TestCase):
+    def test_skipped_consolidator_rewires_consumer(self) -> None:
+        iids = ["loader", "dtm", "c1", "c2"]
+        edges = [
+            ("loader", "dtm", PC, PC),
+            ("dtm", "c1", DTM_MOSAIC, DTM_MOSAIC),
+            ("c1", "c2", DTM_MOSAIC, DTM_MOSAIC),
+        ]
+        keep, rewired = prune_nodes(iids, edges, {"c1"})
+        self.assertEqual(keep, ["loader", "dtm", "c2"])
+        self.assertIn(("dtm", "c2", DTM_MOSAIC, DTM_MOSAIC), rewired)
+        self.assertTrue(all("c1" not in (s, d) for s, d, _, _ in rewired))
+
+    def test_empty_skip_returns_same_graph(self) -> None:
+        iids = ["loader", "dtm"]
+        edges = [("loader", "dtm", PC, PC)]
+        self.assertEqual(
+            prune_nodes(iids, edges, set()), (iids, edges))
 
 
 if __name__ == "__main__":

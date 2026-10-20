@@ -41,7 +41,15 @@ PROCESSING_SPECS = {
     "input_port": "point_cloud",
     "output_files": {"coverage_raster": "coverage_mosaic.tif"},
     "output_port": "coverage_raster",
+    "input_globs": ("coverage/**/*.tif",),
     "output_globs": ("coverage/**/*.tif", "coverage_mosaic.tif"),
+    # CountAccumulator (int32 count + float32 sum): the tile grid scales
+    # with tile AREA at resolution, not with points.
+    "grid_bytes_per_cell": 8,
+    "grid_resolution_keys": ("resolution",),
+    # Dispatch working set in cell copies (plain merge): the gate budgets
+    # the direct need when it fits, the window peak when it streams.
+    "merge_copies": 3.0,
     "qml": {"coverage_mosaic.tif": "coverage"},
     "config_schema": {
         "resolution": {
@@ -87,7 +95,6 @@ def tile_flightline_coverage(tile: dict, ctx: dict) -> dict:
     from lynceus.processing import provenance
     from lynceus.processing.raster import (
         CountAccumulator,
-        core_mask,
         write_geotiff,
     )
     from lynceus.processing.tiler import _laz_backend
@@ -118,7 +125,7 @@ def tile_flightline_coverage(tile: dict, ctx: dict) -> dict:
             for chunk in reader.chunk_iterator(2_000_000):
                 x = np.asarray(chunk.x)
                 y = np.asarray(chunk.y)
-                mask = core_mask(x, y, tile)
+                mask = acc.extent_mask(x, y)
                 if not mask.any():
                     continue
                 if needs_source:
@@ -150,7 +157,7 @@ def tile_flightline_coverage(tile: dict, ctx: dict) -> dict:
 def barrier_flightline_coverage(ctx: dict) -> dict:
     """Merge all coverage tiles into a mosaic."""
     from lynceus.processing import provenance
-    from lynceus.processing.raster import merge_geotiffs
+    from lynceus.processing.raster import finish_mosaic
 
     prov_doc = provenance.build_provenance(ctx, "coverage_mosaic.tif")
     from lynceus.nodes._paths import scoped_dir, scoped_file
@@ -160,7 +167,12 @@ def barrier_flightline_coverage(ctx: dict) -> dict:
         raise RuntimeError("No coverage tiles generated")
     nodata = float(ctx.get("nodata_value", -9999.0))
     out_path = scoped_file(ctx, "coverage_mosaic.tif")
-    merge_geotiffs(paths, ctx.get("crs"), out_path, nodata=nodata, metadata=prov_doc)
+    finish_mosaic(
+        paths, out_path, crs=ctx.get("crs"), nodata=nodata, metadata=prov_doc,
+        crop_to_valid=False,
+        memory_budget_bytes=ctx.get("_raster_grid_memory_budget_bytes"),
+        notes=ctx.setdefault("_bounded_notes", []),
+    )
     return {"file": out_path, "kind": "coverage_raster", "node": NODE_ID}
 
 

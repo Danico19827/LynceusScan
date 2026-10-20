@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from lynceus.plugins.locale import locale_manager, t
+from lynceus.ui.dialogs import localize_buttons
 from lynceus.ui.fonts import available_families
 from lynceus.ui.translate import set_combo_items
 from lynceus.ui.theming import available_themes
@@ -67,6 +68,7 @@ from lynceus.ui.settings_keys import (
     MEMORY_PERCENT_KEY,
     OPERATOR_NAME_KEY,
     OPERATOR_ORG_KEY,
+    OUTPUT_ROOT_KEY,
     RECENT_LIMIT_DEFAULT,
     RECENT_LIMIT_KEY,
     SETTINGS_APP,
@@ -78,7 +80,6 @@ from lynceus.ui.settings_keys import (
 )
 
 ACCEL_MODES = ("auto", "on", "off")
-ACCEL_BACKENDS = ("auto", "cpu", "cuda", "opencl", "directml")
 
 
 def _settings() -> QSettings:
@@ -176,6 +177,26 @@ class _GeneralPage(QWidget):
             "Toggle anytime with Ctrl+G.",
             self,
         ))
+        self.output_root = QLineEdit(self)
+        self.output_root.setPlaceholderText(t("Default"))
+        self.output_root.setProperty("origPh_en", "Default")
+        browse = QPushButton(t("Browse\u2026"), self)
+        browse.setProperty("origText_en", "Browse\u2026")
+        browse.clicked.connect(self._pick_output_root)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.output_root, 1)
+        row.addWidget(browse)
+        box = QWidget(self)
+        box.setLayout(row)
+        form.addRow(_T("Output folder"), box)
+        form.addRow(_desc(
+            "Where runs store their sessions (artifacts, quality report, "
+            "cache). Leave empty for the default output folder. Changing it "
+            "redirects future runs only; existing sessions stay where they "
+            "are. The CLI --output flag, when given, overrides this value.",
+            self,
+        ))
         self.load()
 
     def _reload_theme(self) -> None:
@@ -183,6 +204,17 @@ class _GeneralPage(QWidget):
             self.theme,
             [(label, tid) for tid, label in available_themes()],
         )
+
+    def _pick_output_root(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+
+        current = self.output_root.text().strip()
+        initial = current if os.path.isdir(current) else ""
+        folder = QFileDialog.getExistingDirectory(
+            self, t("Choose output folder"), initial
+        )
+        if folder:
+            self.output_root.setText(folder)
 
     def _reload_fonts(self) -> None:
         set_combo_items(
@@ -235,6 +267,9 @@ class _GeneralPage(QWidget):
         self.recent_limit.setValue(min(30, max(5, recent)))
         snap = settings.value(SNAP_KEY, True)
         self.snap.setChecked(str(snap).lower() not in ("false", "0", ""))
+        self.output_root.setText(
+            str(settings.value(OUTPUT_ROOT_KEY, "") or "").strip()
+        )
 
     def save(self) -> None:
         settings = _settings()
@@ -247,6 +282,9 @@ class _GeneralPage(QWidget):
         settings.setValue(SHOW_START_KEY, self.show_start.isChecked())
         settings.setValue(RECENT_LIMIT_KEY, self.recent_limit.value())
         settings.setValue(SNAP_KEY, self.snap.isChecked())
+        settings.setValue(
+            OUTPUT_ROOT_KEY, self.output_root.text().strip()
+        )
 
     def restore_defaults(self) -> None:
         self.language.setCurrentIndex(max(0, self.language.findData("en")))
@@ -260,6 +298,7 @@ class _GeneralPage(QWidget):
         self.show_start.setChecked(True)
         self.recent_limit.setValue(RECENT_LIMIT_DEFAULT)
         self.snap.setChecked(True)
+        self.output_root.setText("")
 
 
 class _PerformancePage(QWidget):
@@ -323,6 +362,9 @@ class _PerformancePage(QWidget):
         self.keep_intermediates = QCheckBox(
             t("Keep intermediate files and session cache"), self
         )
+        self.keep_intermediates.setProperty(
+            "origText_en", "Keep intermediate files and session cache"
+        )
         layout.addWidget(self.keep_intermediates)
         layout.addWidget(_desc(
             "Keep per-tile intermediates and the shared tile cache so "
@@ -334,6 +376,9 @@ class _PerformancePage(QWidget):
         hint = QLabel(
             t("Performance settings apply to the next run."),
             self,
+        )
+        hint.setProperty(
+            "origText_en", "Performance settings apply to the next run."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
@@ -365,11 +410,13 @@ class _PerformancePage(QWidget):
         )
 
     def _reload_accel_backend(self) -> None:
+        from lynceus.processing.acceleration import available_backends
+
         set_combo_items(
             self.accel_backend,
             [
                 ("Auto" if backend == "auto" else backend.upper(), backend)
-                for backend in ACCEL_BACKENDS
+                for backend in available_backends()
             ],
         )
 
@@ -407,9 +454,12 @@ class _PerformancePage(QWidget):
             max(0, list(ACCEL_MODES).index(mode) if mode in ACCEL_MODES else 0)
         )
         backend = str(settings.value(ACCEL_BACKEND_KEY, "auto") or "auto")
+        from lynceus.processing.acceleration import available_backends
+
+        offered = available_backends()
         self.accel_backend.setCurrentIndex(
-            max(0, list(ACCEL_BACKENDS).index(backend)
-                if backend in ACCEL_BACKENDS else 0)
+            max(0, self.accel_backend.findData(
+                backend if backend in offered else "auto"))
         )
         self._reload_devices()
         device = str(settings.value(ACCEL_DEVICE_KEY, "") or "")
@@ -449,12 +499,17 @@ BUDGET_PRESETS = (
     ("3M", 3_000_000),
     ("6M", 6_000_000),
     ("12M", 12_000_000),
+    ("25M", 25_000_000),
+    ("50M", 50_000_000),
+    ("100M", 100_000_000),
 )
 RASTER_CELL_PRESETS = (
     ("1M", 1_000_000),
     ("2M", 2_000_000),
     ("4M", 4_000_000),
     ("8M", 8_000_000),
+    ("16M", 16_000_000),
+    ("32M", 32_000_000),
 )
 TABLE_ROW_PRESETS = (
     ("1k", 1_000),
@@ -462,6 +517,8 @@ TABLE_ROW_PRESETS = (
     ("5k", 5_000),
     ("10k", 10_000),
     ("20k", 20_000),
+    ("50k", 50_000),
+    ("100k", 100_000),
 )
 
 
@@ -699,16 +756,21 @@ class PreferencesDialog(QDialog):
         bottom.addWidget(self._buttons)
         root.addLayout(bottom)
         # Standard buttons follow the OS locale, not the app language: pin
-        # our own text so Apply translates with everything else.
-        apply_btn = self._buttons.button(
-            QDialogButtonBox.StandardButton.Apply
+        # our own texts so the whole box translates with everything else.
+        localize_buttons(
+            self._buttons, "Ok", "Apply", "Cancel"
         )
-        apply_btn.setProperty("origText_en", "Apply")
-        apply_btn.setText(t("Apply"))
 
     def _on_restore(self) -> None:
         for _label, page in self._pages:
             page.restore_defaults()
+
+    def select_section(self, section_en: str) -> None:
+        """Jump to a section by its English name (pre-flight advisor)."""
+        if section_en not in self._nav_en:
+            return
+        row = self._nav_en.index(section_en)
+        self.nav.setCurrentRow(row)
 
     def _on_language_changed(self, _code: str) -> None:
         """Re-run the translate pass over the open dialog (Apply path)."""

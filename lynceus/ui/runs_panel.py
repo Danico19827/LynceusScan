@@ -21,14 +21,13 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QMenu,
-    QMessageBox,
     QProgressDialog,
     QStyle,
     QToolButton,
@@ -39,7 +38,17 @@ from PySide6.QtWidgets import (
 )
 
 from lynceus.plugins.locale import t
-from lynceus.processing.controller import default_output_root
+from lynceus.processing.controller import resolve_output_root
+from lynceus.ui.dialogs import (
+    ask_yes_no,
+    show_critical,
+    show_info,
+)
+from lynceus.ui.settings_keys import (
+    OUTPUT_ROOT_KEY,
+    SETTINGS_APP,
+    SETTINGS_ORG,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -344,7 +353,6 @@ class RunsPanel(QWidget):
         super().__init__(parent)
         self.setObjectName("runsPanel")
         self._session_root: Optional[Path] = None
-        self._always_root: Path = default_output_root()
         self._active_check = active_check or (lambda _p: False)
         self._run_active_check: Callable[[], bool] = lambda: False
         self._signals = _PanelSignals(self)
@@ -356,6 +364,9 @@ class RunsPanel(QWidget):
         self._size_stop = threading.Event()
         self._purge_stop = threading.Event()
         self._purge_dialog = None
+        # Session rows whose file children are already materialized (item 41:
+        # sessions list collapsed; files load once, on first expand).
+        self._populated: set[str] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 2, 0, 0)
@@ -374,6 +385,7 @@ class RunsPanel(QWidget):
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.tree.itemExpanded.connect(self._on_item_expanded)
         self.tree.currentItemChanged.connect(
             lambda *_a: self._update_buttons_state()
         )
@@ -391,6 +403,20 @@ class RunsPanel(QWidget):
     # ------------------------------------------------------------------
     # Header construction
     # ------------------------------------------------------------------
+
+    @property
+    def _always_root(self) -> Path:
+        """Active output root (item 43): honors the Preferences setting.
+
+        Reads the QSettings value live so a preference change applies on the
+        next panel refresh without a reopen; falls back to the package
+        default root when empty.
+        """
+        value = str(
+            QSettings(SETTINGS_ORG, SETTINGS_APP).value(OUTPUT_ROOT_KEY, "")
+            or ""
+        )
+        return resolve_output_root(value)
 
     def _build_header(self) -> QFrame:
         frame = QFrame(self)
@@ -517,30 +543,83 @@ class RunsPanel(QWidget):
         return ordered
 
     @staticmethod
-    @staticmethod
     def _session_badge(session: Path) -> str:
-        """Session label with QA verdict/product count when reported.
+        """One-line session summary: status · time · source · N products.
 
-        Reads ``quality_report.json`` (best-effort); sessions without one
-        (legacy or still running) show the plain timestamp.
+        Status prefers the QA verdict (PASS/FAIL); without a report the
+        pipeline status from ``session_meta.json`` applies (RUNNING /
+        COMPLETED / FAILED / CANCELLED — motor tokens, English by design).
+        Source prefers the session_meta source files; without metadata the
+        line stays sparse (the tree context already locates the session).
+        Every file read is best-effort: legacy or running sessions show
+        whatever is on disk.
         """
+        verdict: Optional[str] = None
+        products: Optional[int] = None
         try:
             report = json.loads(
                 (session / "quality_report.json").read_text(encoding="utf-8")
             )
         except (OSError, ValueError):
-            return session.name
-        if not isinstance(report, dict):
-            return session.name
-        verdict = report.get("verdict")
-        counts = report.get("counts") or {}
-        products = counts.get("products_written")
-        label = session.name
-        if verdict in ("PASS", "FAIL"):
-            label += f" · {verdict}"
-        if isinstance(products, int):
-            label += f" · {products} products"
-        return label
+            report = None
+        if isinstance(report, dict):
+            if report.get("verdict") in ("PASS", "FAIL"):
+                verdict = report["verdict"]
+            counts = report.get("counts") or {}
+            if isinstance(counts.get("products_written"), int):
+                products = counts["products_written"]
+        status: Optional[str] = None
+        source: Optional[str] = None
+        cancelled = False
+        try:
+            meta = json.loads(
+                (session / "session_meta.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            meta = None
+        if isinstance(meta, dict):
+            if meta.get("pipeline_status") == "cancelled":
+                # Display-only: a stopped run reads CANCELLED, never FAIL —
+                # the quality verdict on partial runs misleads otherwise.
+                cancelled = True
+            if verdict is None and not cancelled:
+                raw = meta.get("pipeline_status")
+                if isinstance(raw, str) and raw.strip():
+                    status = raw.strip().upper()
+            files: list[str] = []
+            entries = meta.get("sources")
+            if isinstance(entries, list):
+                for entry in entries:
+                    name = (
+                        entry.get("file")
+                        if isinstance(entry, dict)
+                        else entry
+                    )
+                    if isinstance(name, str) and name.strip():
+                        base = Path(name.strip()).name
+                        if base and base not in files:
+                            files.append(base)
+            if not files:
+                single = meta.get("source_file")
+                if isinstance(single, str) and single.strip():
+                    base = Path(single.strip()).name
+                    if base:
+                        files.append(base)
+            if files:
+                shown = ", ".join(files[:2])
+                if len(files) > 2:
+                    shown += f" +{len(files) - 2}"
+                source = shown
+        parts = [(
+            "CANCELLED" if cancelled
+            else (verdict if verdict is not None else status)
+        )]
+        parts.append(session.name)
+        if source:
+            parts.append(source)
+        if products is not None:
+            parts.append(f"{products} products")
+        return " · ".join(part for part in parts if part)
 
     def _collect_in(
         self, directory: Path, origins: dict[Path, list[Path]]
@@ -601,8 +680,10 @@ class RunsPanel(QWidget):
         a failed collect keeps the previous tree instead of blanking the
         panel (which used to hide sessions that were still on disk).
 
-        Layout is a nested ``output → project/source → sessions`` tree,
-        everything collapsed except the chain holding the newest session.
+        Layout is a nested ``output → project/source → sessions`` tree:
+        sessions list collapsed in one line each (files load on expand);
+        only the chain holding the newest session is expanded, down to the
+        session row itself.
         """
         selected = self._selected_path()
         try:
@@ -620,6 +701,7 @@ class RunsPanel(QWidget):
                         newest = session
 
         self.tree.clear()
+        self._populated.clear()
         root_label = self._always_root.name or str(self._always_root)
         total = sum(
             len(sessions) for _, sources in grouped for _, sessions in sources
@@ -635,10 +717,7 @@ class RunsPanel(QWidget):
         for group, sources in grouped:
             if group:
                 group_path = self._always_root / group
-                group_item = QTreeWidgetItem(
-                    [f"{group}  [{t('Runs')}: "
-                     f"{sum(len(s) for _, s in sources)}]"]
-                )
+                group_item = QTreeWidgetItem([group])
                 group_item.setData(0, Qt.ItemDataRole.UserRole, str(group_path))
                 group_item.setData(0, Qt.ItemDataRole.ToolTipRole, str(group_path))
                 group_item.setData(0, Qt.ItemDataRole.FontRole, self._bold_font())
@@ -653,9 +732,7 @@ class RunsPanel(QWidget):
                         if group
                         else (self._always_root / source)
                     )
-                    source_item = QTreeWidgetItem(
-                        [f"{source}  [{t('Runs')}: {len(sessions)}]"]
-                    )
+                    source_item = QTreeWidgetItem([source])
                     source_item.setData(0, Qt.ItemDataRole.UserRole, str(source_path))
                     source_item.setData(0, Qt.ItemDataRole.ToolTipRole, str(source_path))
                     parent.addChild(source_item)
@@ -668,13 +745,14 @@ class RunsPanel(QWidget):
         root_item.setExpanded(True)
 
         if selected is not None:
+            self._populate_ancestor(selected)
             self._select_path(selected)
         self._update_empty_state()
         self._update_buttons_state()
         self._update_cache_button()
 
     def _expand_newest(self, root_item: QTreeWidgetItem, newest: Path | None) -> None:
-        """Expand only the chain holding the newest session."""
+        """Expand the chain holding the newest session, not the session row."""
         if newest is None:
             return
         target = str(newest)
@@ -684,7 +762,9 @@ class RunsPanel(QWidget):
             for index in range(item.childCount()):
                 child = item.child(index)
                 data = child.data(0, Qt.ItemDataRole.UserRole)
-                if target == data or target.startswith(str(data) + os.sep):
+                if target == data:
+                    continue  # the session itself stays collapsed
+                if target.startswith(str(data) + os.sep):
                     child.setExpanded(True)
                     stack.append(child)
 
@@ -696,17 +776,72 @@ class RunsPanel(QWidget):
         return font
 
     def _add_session(self, session: Path, parent: QTreeWidgetItem) -> None:
+        """One collapsed session row; file children load on first expand."""
         item = QTreeWidgetItem([self._session_badge(session)])
         item.setData(0, Qt.ItemDataRole.UserRole, str(session))
         item.setData(0, Qt.ItemDataRole.ToolTipRole, str(session))
         item.setToolTip(0, str(session))
+        item.setChildIndicatorPolicy(
+            QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+        )
         parent.addChild(item)
 
-        for child in _session_children(session):
+    def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
+        # Only session rows lazy-load: group/source/root children are
+        # eager, and populating them would duplicate their rows.
+        val = item.data(0, Qt.ItemDataRole.UserRole)
+        if not val:
+            return
+        path = Path(val)
+        if _is_session_dir(path):
+            self._populate_children(item, path)
+
+    def _populate_children(
+        self, item: QTreeWidgetItem, path: Path
+    ) -> None:
+        """Materialize one level of file children, once per refresh.
+
+        Sessions list collapsed so refreshes stay proportional to the
+        session count; expanding a session reads its single directory
+        level on demand. Empty directories lose the expander arrow.
+        """
+        key = str(path)
+        if key in self._populated:
+            return
+        self._populated.add(key)
+        children = _session_children(path) if path.is_dir() else []
+        for child in children:
             leaf = QTreeWidgetItem([child.name])
             leaf.setData(0, Qt.ItemDataRole.UserRole, str(child))
             leaf.setData(0, Qt.ItemDataRole.ToolTipRole, str(child))
             item.addChild(leaf)
+        if not children:
+            item.setChildIndicatorPolicy(
+                QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicator
+            )
+
+    def _populate_ancestor(self, target: Path) -> None:
+        """Pre-load a session row holding the path being re-selected.
+
+        After a refresh the file children are lazy; a previously selected
+        file would otherwise not be found by ``_select_path``.
+        """
+        wanted = str(target)
+        stack = [
+            self.tree.topLevelItem(i)
+            for i in range(self.tree.topLevelItemCount())
+        ]
+        while stack:
+            item = stack.pop()
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if (
+                data
+                and wanted.startswith(str(data) + os.sep)
+                and _is_session_dir(Path(data))
+            ):
+                self._populate_children(item, Path(data))
+            for index in range(item.childCount()):
+                stack.append(item.child(index))
 
     # ------------------------------------------------------------------
     # Header actions
@@ -811,7 +946,7 @@ class RunsPanel(QWidget):
         run starting mid-purge aborts it.
         """
         if self._run_active_check():
-            QMessageBox.information(
+            show_info(
                 self,
                 t("Run in progress"),
                 t("Wait for the current run to finish before clearing the cache."),
@@ -821,24 +956,22 @@ class RunsPanel(QWidget):
         if size is not None and size <= 0:
             return
         if size is None:
-            ret = QMessageBox.question(
+            ok = ask_yes_no(
                 self,
                 t("Clear tile cache"),
                 t("Delete all cached tiles? "
                   "They will be rebuilt on the next run."),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
         else:
-            ret = QMessageBox.question(
+            ok = ask_yes_no(
                 self,
                 t("Clear tile cache"),
                 t(
                     "Tile cache uses {size}. Delete all cached tiles? "
                     "They will be rebuilt on the next run."
                 ).format(size=_cache_size_label(size)),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-        if ret != QMessageBox.StandardButton.Yes:
+        if not ok:
             return
         self._purge_stop.set()
         self._purge_stop = threading.Event()
@@ -889,13 +1022,13 @@ class RunsPanel(QWidget):
                 pass
         self.btn_cache.setEnabled(True)
         if cancelled:
-            QMessageBox.information(
+            show_info(
                 self,
                 t("Run in progress"),
                 t("Wait for the current run to finish before clearing the cache."),
             )
         elif errors:
-            QMessageBox.critical(
+            show_critical(
                 self,
                 t("Clear tile cache"),
                 t("Could not delete tile cache"),
@@ -962,26 +1095,24 @@ class RunsPanel(QWidget):
         if not sessions:
             return
         if self._run_active_check():
-            QMessageBox.information(
+            show_info(
                 self,
                 t("Run in progress"),
                 t("Wait for the current run to finish before deleting."),
             )
             return
-        ret = QMessageBox.question(
+        if not ask_yes_no(
             self,
             t("Delete"),
             t("Delete {n} runs in '{name}'? This cannot be undone.").format(
                 n=len(sessions), name=path.name
             ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if ret != QMessageBox.StandardButton.Yes:
+        ):
             return
         try:
             _remove_session_dir(path)
         except OSError as exc:
-            QMessageBox.critical(
+            show_critical(
                 self,
                 t("Delete"),
                 f"{t('Could not delete the run')}: {exc}",
@@ -995,24 +1126,22 @@ class RunsPanel(QWidget):
         if not _is_session_dir(path):
             return
         if self._active_check(path):
-            QMessageBox.information(
+            show_info(
                 self,
                 t("Runs"),
                 t("This run is currently being processed."),
             )
             return
-        ret = QMessageBox.question(
+        if not ask_yes_no(
             self,
             t("Delete"),
             t("Are you sure you want to delete this run?"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if ret != QMessageBox.StandardButton.Yes:
+        ):
             return
         try:
             _remove_session_dir(path)
         except OSError as exc:
-            QMessageBox.critical(
+            show_critical(
                 self,
                 t("Delete"),
                 f"{t('Could not delete the run')}: {exc}",

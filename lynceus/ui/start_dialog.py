@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import QSettings, QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -36,7 +36,48 @@ from PySide6.QtWidgets import (
 from lynceus import project as project_io
 from lynceus import templates as templates_io
 from lynceus.plugins.locale import t
+from lynceus.ui.dialogs import localize_buttons
 from lynceus.ui.settings_keys import SETTINGS_APP, SETTINGS_ORG
+
+
+def _card_widget(title: str, subtitle: str, enabled: bool = True) -> QWidget:
+    """Two-line list card reusing the extensions typography (extName/detail)."""
+    card = QWidget()
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(2, 4, 2, 4)
+    layout.setSpacing(0)
+    name = QLabel(title)
+    name.setObjectName("extName")
+    layout.addWidget(name)
+    if subtitle:
+        sub = QLabel(subtitle)
+        sub.setObjectName("extDetail")
+        layout.addWidget(sub)
+    card.setEnabled(enabled)
+    return card
+
+
+def _fit_card_item(item: QListWidgetItem) -> None:
+    """Fixed-height rows: the list stretches the width, never the height."""
+    item.setSizeHint(QSize(10, 54))
+
+
+def _lockup_pixmap(height: int):
+    """Theme-tinted brand lockup for the launcher header (null-safe)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QPixmap
+
+    from lynceus.ui.branding import THEME_COLORS, tint_lockup
+
+    try:
+        image = tint_lockup(QColor(THEME_COLORS["text"]))
+        if image.isNull():
+            return QPixmap()
+        pixmap = QPixmap.fromImage(image)
+        return pixmap.scaledToHeight(
+            height, Qt.TransformationMode.SmoothTransformation)
+    except Exception:
+        return QPixmap()
 
 
 class TemplateListWidget(QWidget):
@@ -60,12 +101,16 @@ class TemplateListWidget(QWidget):
                 label += f"  [{t('My Templates')}]"
             if not info.valid:
                 label += f"  ({t('Invalid')})"
-            item = QListWidgetItem(label)
+            item = QListWidgetItem()
             item.setToolTip(info.description or info.name)
             item.setData(Qt.ItemDataRole.UserRole, info.path)
             if not info.valid:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
             self.list.addItem(item)
+            self.list.setItemWidget(
+                item, _card_widget(label, (info.description or "").split("\n")[0][:80],
+                                   enabled=bool(info.valid)))
+            _fit_card_item(item)
         self.list.currentItemChanged.connect(lambda *_: self._on_selected())
         layout.addWidget(self.list, 1)
 
@@ -131,10 +176,21 @@ class StartDialog(QDialog):
         self._action: tuple[str, str | None, bool] = ("blank", None, False)
 
         root = QVBoxLayout(self)
-        title = QLabel("<b>LynceusScan</b>")
-        title.setObjectName("startTitle")
-        root.addWidget(title)
-        root.addWidget(QLabel(t("Where do you want to start?")))
+        lockup = QLabel()
+        lockup.setObjectName("startLockup")
+        lockup.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        art = _lockup_pixmap(90)
+        if not art.isNull():
+            lockup.setPixmap(art)
+            lockup.setFixedHeight(90)
+            root.addWidget(lockup)
+        else:
+            title = QLabel("<b>LynceusScan</b>")
+            title.setObjectName("startTitle")
+            root.addWidget(title)
+        subtitle = QLabel(t("Where do you want to start?"))
+        subtitle.setObjectName("startSubtitle")
+        root.addWidget(subtitle)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.addWidget(self._build_left(recent_paths))
@@ -169,19 +225,22 @@ class StartDialog(QDialog):
         open_btn.clicked.connect(self._choose_file)
         layout.addWidget(open_btn)
 
-        layout.addWidget(QLabel(t("Recent Projects"), panel))
+        recent_header = QLabel(t("Recent Projects"), panel)
+        recent_header.setObjectName("startSection")
+        layout.addWidget(recent_header)
         self._recent_list = QListWidget(panel)
         self._recent_list.setObjectName("recentList")
         shown = 0
         for path in recent_paths:
             if not Path(path).is_file():
                 continue
-            item = QListWidgetItem(
-                f"{Path(path).stem}  ({Path(path).parent})"
-            )
+            item = QListWidgetItem()
             item.setToolTip(path)
             item.setData(Qt.ItemDataRole.UserRole, path)
             self._recent_list.addItem(item)
+            self._recent_list.setItemWidget(
+                item, _card_widget(Path(path).stem, str(Path(path).parent)))
+            _fit_card_item(item)
             shown += 1
         if shown == 0:
             empty = QListWidgetItem(t("No recent projects"))
@@ -197,7 +256,9 @@ class StartDialog(QDialog):
         panel = QWidget(self)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 0, 0, 0)
-        layout.addWidget(QLabel(t("Templates"), panel))
+        templates_header = QLabel(t("Templates"), panel)
+        templates_header.setObjectName("startSection")
+        layout.addWidget(templates_header)
         if templates:
             self._template_list = TemplateListWidget(templates, panel)
             layout.addWidget(self._template_list, 1)
@@ -286,6 +347,7 @@ class TemplatePickerDialog(QDialog):
         )
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
+        localize_buttons(buttons, "Cancel")
         layout.addWidget(buttons)
 
     def _on_accept(self) -> None:
@@ -331,6 +393,7 @@ class TemplateMetaDialog(QDialog):
         )
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
+        localize_buttons(buttons, "Save", "Cancel")
         layout.addWidget(buttons)
 
     def _on_accept(self) -> None:

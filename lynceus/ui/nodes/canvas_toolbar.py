@@ -89,6 +89,8 @@ class CanvasToolbar(QWidget):
         self.btn_cancel.clicked.connect(self.cancel_requested)
 
         self.btn_collapse = self._make_button("\u00ab", "Collapse toolbar")
+        self.btn_collapse.setObjectName("btnCollapse")
+        self.btn_collapse.setFixedSize(24, 24)
         self.btn_collapse.clicked.connect(self.toggle)
 
         for widget in (
@@ -153,6 +155,8 @@ class CanvasToolbar(QWidget):
         layout.setSpacing(0)
 
         self.btn_expand = self._make_button("\u00bb", "Expand toolbar")
+        self.btn_expand.setObjectName("btnExpand")
+        self.btn_expand.setFixedSize(24, 24)
         self.btn_expand.clicked.connect(self.toggle)
 
         layout.addWidget(self.btn_expand)

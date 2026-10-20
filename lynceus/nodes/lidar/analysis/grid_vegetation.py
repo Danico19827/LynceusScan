@@ -85,6 +85,7 @@ PROCESSING_SPECS = {
     "input_port": "point_cloud",
     "output_files": {"grid_vegetation": "grid_vegetation.gpkg"},
     "output_port": "grid_vegetation",
+    "input_globs": ("grid_vegetation/**/*.gpkg",),
     "output_globs": (
         "grid_vegetation/**/*.gpkg",
         "grid_vegetation.gpkg",
@@ -355,6 +356,46 @@ def _dtm_reference(parts: list, tile: dict, ctx: dict):
     return base, dropped, None
 
 
+VEG_AGG_COLUMNS = {f"h{b}": ("int64", "sum") for b in range(HIST_BINS)}
+"""Keyed-aggregation spec for histogram partials (sums only; cell
+columns derive from the gid, geometry from the grid)."""
+
+
+def read_vegetation_partials(path: str):
+    """Read one partial table for the streaming merge (no geometry)."""
+    import geopandas as gpd
+
+    frame = gpd.read_file(path)
+    if frame is None or len(frame) == 0:
+        return frame
+    keep = ["gid", *[f"h{b}" for b in range(HIST_BINS)]]
+    return frame[[c for c in keep if c in frame.columns]]
+
+
+def merge_vegetation_stream(files, *, batch_rows: int = 200_000):
+    """Yield ``(gids, cols, rows, hists, n)`` batches with bounded RAM.
+
+    Same sums as :func:`merge_vegetation_frames` via the shared keyed
+    engine; each batch feeds :func:`finalize_vegetation_frame` directly.
+    """
+    import numpy as np
+
+    from lynceus.processing.chunked_merge import stream_keyed_groups
+
+    hcols = [f"h{b}" for b in range(HIST_BINS)]
+    stream = stream_keyed_groups(
+        [str(p) for p in files], key="gid", columns=VEG_AGG_COLUMNS,
+        reader=read_vegetation_partials, batch_rows=batch_rows)
+    for batch in stream:
+        gids = batch["gid"].tolist()
+        split = [g.rsplit("_", 1) for g in gids]
+        cols = np.array([int(s[0]) for s in split], dtype=np.int64)
+        rows = np.array([int(s[1]) for s in split], dtype=np.int64)
+        hists = np.stack(
+            [batch[c].to_numpy(dtype=np.int64) for c in hcols], axis=1)
+        yield gids, cols, rows, hists, hists.sum(axis=1).astype(np.int64)
+
+
 def merge_vegetation_frames(frames):
     """Merge tile/segment partial tables into exact per-cell histograms.
 
@@ -443,6 +484,10 @@ def finalize_vegetation_frame(gids, cols, rows, hists, n, res: float,
         "density_above_10m": density_above_10m,
         "l_skewness": l_skewness,
         **{f"p{p}": percentiles[p] for p in PERCENTILES},
+        # Hidden partials for exact cross-segment merges (bookkeeping:
+        # never styled, never in metrics_computed — the sidecar already
+        # lists them, and consolidates sum them like any other partial).
+        **{f"h{b}": hists[:, b].astype(np.int64) for b in range(HIST_BINS)},
     }
     return records
 
@@ -452,6 +497,12 @@ def barrier_grid_vegetation(ctx: dict) -> dict:
     import geopandas as gpd
 
     from lynceus.nodes._paths import scoped_dir, scoped_file
+    from lynceus.processing.chunked_merge import (
+        append_gpkg,
+        init_gpkg,
+        note_streamed,
+        tables_fit,
+    )
 
     res = float(ctx.get("resolution", 1.0))
     nodata = float(ctx.get("nodata_value", -9999.0))
@@ -460,13 +511,10 @@ def barrier_grid_vegetation(ctx: dict) -> dict:
     paths = sorted(scoped_dir(ctx, "grid_vegetation").glob("*.gpkg"))
     if not paths:
         raise RuntimeError("No grid vegetation tiles generated")
-    frames = []
-    for path in paths:
-        frame = gpd.read_file(path)
-        if frame is not None and len(frame) > 0:
-            frames.append(frame)
     out_path = scoped_file(ctx, "grid_vegetation.gpkg")
-    if not frames:
+    budget = ctx.get("_raster_grid_memory_budget_bytes")
+
+    def _empty_result():
         gdf = _empty_frame(clean_crs(ctx.get("crs")))
         csv_path = _finalize_vegetation(
             gdf, ctx, out_path, nodata, res,
@@ -476,20 +524,74 @@ def barrier_grid_vegetation(ctx: dict) -> dict:
                 "node": NODE_ID,
                 "warnings": ["No vegetation points in tile cores; grid vegetation is empty."]}
 
-    gids, cols, rows, hists, n = merge_vegetation_frames(frames)
-    finals = finalize_vegetation_frame(
-        gids, cols, rows, hists, n, res, threshold_m, lai_k, nodata
-    )
-    gdf = gpd.GeoDataFrame(
-        finals,
-        geometry=_veg_polygons(cols, rows, res),
-        crs=frames[0].crs,
-    )
-    csv_path = _finalize_vegetation(
-        gdf, ctx, out_path, nodata, res, [], n_cells=len(gdf)
-    )
+    if tables_fit([str(p) for p in paths], 4.0, budget):
+        frames = []
+        for path in paths:
+            frame = gpd.read_file(path)
+            if frame is not None and len(frame) > 0:
+                frames.append(frame)
+        if not frames:
+            return _empty_result()
+        gids, cols, rows, hists, n = merge_vegetation_frames(frames)
+        finals = finalize_vegetation_frame(
+            gids, cols, rows, hists, n, res, threshold_m, lai_k, nodata
+        )
+        gdf = gpd.GeoDataFrame(
+            finals,
+            geometry=_veg_polygons(cols, rows, res),
+            crs=frames[0].crs,
+        )
+        csv_path = _finalize_vegetation(
+            gdf, ctx, out_path, nodata, res, [], n_cells=len(gdf)
+        )
+        return {"file": out_path, "csv": csv_path, "kind": "grid_vegetation",
+                "node": NODE_ID}
+
+    # Streaming merge: same histogram sums, same finals per batch.
+    note_streamed(ctx, "grid_vegetation.gpkg")
+    stream = merge_vegetation_stream([str(p) for p in paths])
+    first = next(stream, None)
+    if first is None:
+        return _empty_result()
+    crs = _peek_vegetation_crs([str(p) for p in paths])
+    n_cells = 0
+    initialized = False
+    batch = first
+    while True:
+        gids, cols, rows, hists, n = batch
+        finals = finalize_vegetation_frame(
+            gids, cols, rows, hists, n, res, threshold_m, lai_k, nodata
+        )
+        gdf = gpd.GeoDataFrame(
+            finals, geometry=_veg_polygons(cols, rows, res), crs=crs)
+        if not initialized:
+            init_gpkg(out_path, gdf)
+            csv_path = str(Path(out_path).with_suffix(".csv"))
+            gdf.drop(columns=["geometry"]).to_csv(csv_path, index=False)
+            initialized = True
+        else:
+            gdf.drop(columns=["geometry"]).to_csv(
+                csv_path, mode="a", header=False, index=False)
+        append_gpkg(out_path, gdf)
+        n_cells += len(gdf)
+        batch = next(stream, None)
+        if batch is None:
+            break
+    _write_vegetation_sidecar(ctx, out_path, nodata, res, n_cells)
     return {"file": out_path, "csv": csv_path, "kind": "grid_vegetation",
             "node": NODE_ID}
+
+
+def _peek_vegetation_crs(paths: list) -> object:
+    """CRS of the first readable input (cheap single-row peek)."""
+    import geopandas as gpd
+
+    for path in paths:
+        try:
+            return gpd.read_file(path, rows=1).crs
+        except Exception:
+            continue
+    return None
 
 
 def _veg_polygons(cols, rows, res):
@@ -502,21 +604,19 @@ def _veg_polygons(cols, rows, res):
     )
 
 
-def _finalize_vegetation(gdf, ctx, out_path: str, nodata: float, res: float,
-                         warnings: list, n_cells: int | None = None) -> str:
-    """Write the final product: GPKG + CSV twin + metadata + sidecar."""
+def _write_vegetation_sidecar(ctx, out_path: str, nodata: float, res: float,
+                              n_cells: int) -> None:
+    """Write the product sidecar (metrics order, bookkeeping, defaults)."""
     import datetime
 
     from lynceus.processing import provenance
 
     prov_doc = provenance.build_provenance(ctx, "grid_vegetation.gpkg")
-    gdf.to_file(out_path, driver="GPKG")
-    provenance.embed_gpkg_metadata(out_path, prov_doc)
     metadata = {
         "generated_at": datetime.datetime.now().isoformat(),
         "node_id": NODE_ID,
         "grid_size_m": res,
-        "n_cells": len(gdf) if n_cells is None else n_cells,
+        "n_cells": n_cells,
         "metrics_computed": list(METRICS_COMPUTED),
         "default_metric": "cover",
         "bookkeeping_cols": list(BOOKKEEPING_COLS) + [
@@ -527,6 +627,18 @@ def _finalize_vegetation(gdf, ctx, out_path: str, nodata: float, res: float,
         "lai_k": float(ctx.get("lai_k", 0.5)),
     }
     provenance.write_sidecar(out_path, prov_doc, metadata)
+
+
+def _finalize_vegetation(gdf, ctx, out_path: str, nodata: float, res: float,
+                         warnings: list, n_cells: int | None = None) -> str:
+    """Write the final product: GPKG + CSV twin + metadata + sidecar."""
+    from lynceus.processing import provenance
+
+    prov_doc = provenance.build_provenance(ctx, "grid_vegetation.gpkg")
+    gdf.to_file(out_path, driver="GPKG")
+    provenance.embed_gpkg_metadata(out_path, prov_doc)
+    _write_vegetation_sidecar(ctx, out_path, nodata, res,
+                              len(gdf) if n_cells is None else n_cells)
     csv_path = str(Path(out_path).with_suffix(".csv"))
     gdf.drop(columns=["geometry"]).to_csv(csv_path, index=False)
     return csv_path

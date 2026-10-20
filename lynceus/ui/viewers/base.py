@@ -90,6 +90,11 @@ class BaseViewer(QWidget):
         self._placeholder = QLabel(t("No data available"))
         self._placeholder.setObjectName("viewerPlaceholder")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Selectable: error placeholders carry the diagnosis the user must
+        # be able to quote back verbatim.
+        self._placeholder.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         # Styled by app.qss (QLabel#viewerPlaceholder) so it follows themes.
         self._layout.addWidget(self._placeholder)
         self._progress = QProgressBar(self)
@@ -98,7 +103,14 @@ class BaseViewer(QWidget):
         self._progress.setTextVisible(False)
         self._progress.setMaximumHeight(4)
         self._progress.hide()
-        self._layout.addWidget(self._progress)
+        # Fixed-height slot: showing/hiding the bar must not reflow the
+        # layout (viewport resize reads as tremor on every load).
+        self._progress_slot = QWidget(self)
+        self._progress_slot.setFixedHeight(4)
+        slot_layout = QVBoxLayout(self._progress_slot)
+        slot_layout.setContentsMargins(0, 0, 0, 0)
+        slot_layout.addWidget(self._progress)
+        self._layout.addWidget(self._progress_slot)
         self._load_generation = 0
         self._async_jobs = {}
         self._placeholder.setSizePolicy(
@@ -117,6 +129,39 @@ class BaseViewer(QWidget):
         self.setWindowTitle(self._compose_title())
 
     def _compose_title(self) -> str:
+        base = viewer_title(self._kind)
+        if self._product_title:
+            return f"{base} — {self._product_title}"
+        return base
+
+    def help_text(self) -> str | None:
+        """Rich-text control help for the "?" button (None = no button).
+
+        Viewers with undiscoverable controls (shortcuts, color modes)
+        override this with a short HTML sheet; the button itself lives
+        once here via ``install_help_button`` so every viewer shares the
+        same affordance.
+        """
+        return None
+
+    def install_help_button(self, layout) -> None:
+        """Append a "?" button showing this viewer help (no-op without)."""
+        if self.help_text() is None:
+            return
+        from PySide6.QtWidgets import QPushButton
+
+        from lynceus.ui.dialogs import show_info
+
+        button = QPushButton("?", self)
+        button.setObjectName("viewerHelpButton")
+        button.setProperty("origText_en", "?")
+        button.setToolTip(t("Help"))
+        button.setProperty("origTip_en", "Help")
+        button.setFixedSize(24, 24)
+        button.clicked.connect(
+            lambda: show_info(self, t("Help"), t(self.help_text()))
+        )
+        layout.addWidget(button)
         base = viewer_title(self._kind)
         if self._product_title:
             return f"{base} — {self._product_title}"

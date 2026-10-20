@@ -74,7 +74,8 @@ def barrier_chm_difference(ctx: dict) -> dict:
     from lynceus.processing.raster import (
         _valid_bounds,
         align_to_grid,
-        read_geotiff,
+        load_dem_masked,
+        refuse_if_unfit,
         write_geotiff,
     )
 
@@ -88,11 +89,19 @@ def barrier_chm_difference(ctx: dict) -> dict:
         raise RuntimeError(
             "CHM Difference requires two CHM mosaics (CHM A and CHM B)"
         )
-    nodata = ctx.get("nodata_value", -9999.0)
+    nodata = float(ctx.get("nodata_value", -9999.0))
     out_path = scoped_file(ctx, "chm_difference.tif")
 
-    a_arr, a_transform, crs_a = read_geotiff(a_path)
-    b_arr, b_transform, _crs_b = read_geotiff(b_path)
+    # Two full float64 DEMs plus aligned copy and masks (~8x the inputs
+    # once decompressed): refuse honestly before any full read.
+    refuse_if_unfit([a_path, b_path], 8.0,
+                    ctx.get("_raster_grid_memory_budget_bytes"),
+                    "CHM difference")
+
+    # Each input honors its own file tag (plus NaN, always); both remap to
+    # the house nodata so the masks below stay exact on foreign rasters.
+    a_arr, a_transform, crs_a, _ = load_dem_masked(a_path, nodata)
+    b_arr, b_transform, _crs_b, _ = load_dem_masked(b_path, nodata)
 
     valid_a = _valid_bounds(a_arr, a_transform, nodata)
     valid_b = _valid_bounds(b_arr, b_transform, nodata)

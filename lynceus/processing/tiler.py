@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import threading
+import time
 from concurrent.futures import (
     FIRST_COMPLETED,
     ThreadPoolExecutor,
@@ -41,6 +42,7 @@ import psutil
 
 from lynceus.processing.acceleration import AccelerationInfo, gpu_array_module
 from lynceus.processing import provenance
+from lynceus.processing.sparse_merge import plan_sparse_merge
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,14 @@ CHUNK_SIZE = 4_000_000         # Points per read chunk.
 BUFFER_FLUSH_SIZE = 8_000_000  # Points per tile before writing to LAZ.
 MAX_IO_THREADS = 4             # Concurrent writer threads.
 IO_FUTURE_WINDOW = 4            # Maximum in-flight write futures.
+# Phase-0b sampler: 1 in N flushes apportions writer-open vs record-write
+# time, so the fixed per-flush cost can be attributed without slowing the
+# pass (two monotonic reads + brief lock on sampled flushes only).
+_TM_SAMPLE_EVERY = 128
+# Progress legs for huge files: percent milestones alone spread apart in
+# time exactly when throughput collapses, so legs also fire on a fixed
+# cadence (each leg is INFO-logged and appended to tiling_telemetry.jsonl).
+_TILING_LEG_SECONDS = 60.0
 # Parallel decode: the two full-file passes are decompression-bound (native LAZ
 # decode releases the GIL), so spans are decoded by a bounded worker pool while
 # the consumer routes strictly in file order (deterministic, worker-count
@@ -76,6 +86,56 @@ CAP_SLACK = 0.9                # Leave 10% headroom below the point cap.
 # silently returned zeros, clipped into tile (0,0)). No migration: stale
 # caches re-tile once.
 MANIFEST_VERSION = 6
+
+
+def backfill_grid_anchor(
+    tiles: list[dict], tile_size_m: float
+) -> list[dict]:
+    """Ensure every tile dict carries its tiling-grid anchor (B1b).
+
+    Fresh manifests already stamp ``grid_ox``/``grid_oy`` per tile; legacy
+    cached manifests predate the keys, and without them the raster snap
+    silently skips and fractional resolutions fall back to OOM-prone
+    direct merges (Fairbanks 20261014). The anchor is shared by the whole
+    tiling, so one derivation covers all tiles: ``ox = core_x_min -
+    col * T`` from the first tile carrying (col, row, core bounds) — the
+    same arithmetic the tiler ran forward, so the ~ulp reconstruction
+    error is uniform and relative phases stay exact (the snap epsilon
+    absorbs it with wide margin). Tiles without (col, bounds) keep
+    legacy behavior. Existing anchors are never overwritten.
+    """
+    try:
+        size = float(tile_size_m)
+    except (TypeError, ValueError):
+        return tiles
+    if not (math.isfinite(size) and size > 0):
+        return tiles
+    source = None
+    for tile in tiles or ():
+        if not isinstance(tile, dict):
+            continue
+        if "grid_ox" in tile or "grid_oy" in tile:
+            continue
+        if source is not None:
+            continue
+        try:
+            source = (
+                int(tile["col"]),
+                int(tile["row"]),
+                float(tile["core_x_min"]),
+                float(tile["core_y_min"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    if source is None:
+        return tiles
+    col, row, cx, cy = source
+    ox, oy = cx - col * size, cy - row * size
+    for tile in tiles or ():
+        if isinstance(tile, dict):
+            tile.setdefault("grid_ox", ox)
+            tile.setdefault("grid_oy", oy)
+    return tiles
 
 
 def system_memory_bytes() -> int:
@@ -117,8 +177,18 @@ class TileIndex:
     sub_level: int = 0
     sub_row: int = 0
     sub_col: int = 0
+    span: int = 0
 
     def __str__(self) -> str:
+        if self.span > 1:
+            # Fused sparse block: uppercase grid + span suffix, visually
+            # distinct from base/sub tiles and disjoint from their names.
+            base = (
+                f"{self.tag}_C{self.col:04d}_R{self.row:04d}"
+                if self.tag
+                else f"tile_C{self.col:04d}_R{self.row:04d}"
+            )
+            return f"{base}_x{self.span:02d}"
         base = (
             f"{self.tag}_c{self.col:04d}_r{self.row:04d}"
             if self.tag
@@ -138,6 +208,7 @@ class TilingResult:
     tile_size_m: float
     buffer_m: float = 0.0
     max_points_per_tile: int = 0
+    merge_sparse_below: int = 0
     max_subdivision: int = 0
     tiles_generated: list[dict] = field(default_factory=list)
     tiles_skipped_empty: int = 0
@@ -152,6 +223,11 @@ class TilingResult:
     """Density census for QA ({first_returns, class_histogram,
     return_histogram}, histograms keyed by str(int)). Same
     cache-absence semantics as flag_counts."""
+    tiling_telemetry: dict = field(default_factory=dict)
+    """Phase-0 throughput diagnostic (writer evictions/reopens, flush
+    count, flush-scan size, IO stall seconds, chunk count). Diagnostic
+    only: never feeds fingerprints or cache keys. Absent on cache hits
+    from manifests written before this field existed."""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -308,12 +384,14 @@ class LiDARTiler:
         tag: str = "",
         acceleration: AccelerationInfo | None = None,
         provenance: dict | None = None,
+        merge_sparse_below: int = 0,
     ):
         self.source_path = Path(source_path)
         self.output_dir = Path(output_dir)
         self.tile_size = tile_size
         self.buffer_m = buffer_m
         self.max_points = int(max_points_per_tile)
+        self.merge_floor = int(merge_sparse_below or 0)
         self.chunk_size = chunk_size
         self.buffer_flush_size = buffer_flush_size
         self.memory_budget_bytes = int(
@@ -324,7 +402,11 @@ class LiDARTiler:
         if output_format not in ("las", "laz"):
             raise ValueError(f"output_format must be 'las' or 'laz', got {output_format!r}")
         self.output_format = output_format
-        self.max_workers = max_workers or (os.cpu_count() or 4)
+        # Unset worker counts take the engine default (one core stays
+        # with the system), matching the process pool policy.
+        from lynceus.processing.executor import default_workers
+
+        self.max_workers = max_workers or default_workers()
         self.overwrite = overwrite
         self.progress_callback = progress_callback
         self.tile_callback = tile_callback
@@ -359,6 +441,14 @@ class LiDARTiler:
         self._tile_stats: dict[int, dict[str, np.ndarray]] = {}
         self._tile_counts: dict[int, int] = {}
         self._tid_index: dict[int, TileIndex] = {}
+        self._tile_header_template: Any = None
+        # Phase-0b sampler lock (IO threads accumulate open/write timings).
+        self._tm_sample_lock = threading.Lock()
+        # Sparse merge routing (P1): None unless the merge floor is set.
+        self._merge_on = False
+        self._merge_map: dict[int, int] | None = None
+        self._merge_supers: dict[int, dict] = {}
+        self._merge_base_counts: dict[int, int] = {}
         self._source_header: laspy.LasHeader | None = None
         self._flag_counts: dict[str, int] = {}
         self._flag_dims: tuple[str, ...] = ()
@@ -372,6 +462,7 @@ class LiDARTiler:
         self._sub_levels: dict[int, int] = {}
         self._nonempty_bases: set[int] = set()
         self._aborted = False
+        self._reset_telemetry()
 
     # ------------------------------------------------------------------
     # Public API.
@@ -385,6 +476,10 @@ class LiDARTiler:
             data.pop("source_size", None)
             data.pop("source_mtime", None)
             data.pop("manifest_version", None)
+            data["tiles_generated"] = backfill_grid_anchor(
+                data.get("tiles_generated", []),
+                data.get("tile_size_m", self.tile_size),
+            )
             return TilingResult(**data)
 
         try:
@@ -414,6 +509,10 @@ class LiDARTiler:
                 "tile_size_m": float(self.tile_size),
                 "buffer_m": float(self.buffer_m),
                 "max_points_per_tile": int(self.max_points),
+                # Legacy manifests predate the merge key: missing reads as
+                # 0.0, which matches the default-off floor, so existing
+                # caches keep reusing without a version bump.
+                "merge_sparse_below": int(self.merge_floor),
             }
             for key, value in key_params.items():
                 try:
@@ -454,6 +553,7 @@ class LiDARTiler:
             "tile_size_m": float(self.tile_size),
             "buffer_m": float(self.buffer_m),
             "max_points_per_tile": int(self.max_points),
+            "merge_sparse_below": int(self.merge_floor),
             "output_format": str(self.output_format),
         }
 
@@ -468,6 +568,29 @@ class LiDARTiler:
                 lock = threading.Lock()
                 self._tile_locks[tid] = lock
             return lock
+
+    def _build_tile_header(self):
+        """Prebuilt per-tile header template (fresh opens clone it).
+
+        A massive sparse tiling opens one writer per micro-tile; rebuilding
+        the header per open (VLR copies + JSON provenance stamp) repeats
+        identical work hundreds of thousands of times. Version, format,
+        scales, offsets, VLRs, identity and provenance are per-run
+        constants, so one template plus a clone per tile is byte-identical
+        to rebuilding (laspy ``.copy()`` owns its arrays/VLRs; the live
+        point counts still start at zero per tile).
+        """
+        header = self._source_header
+        new_header = laspy.LasHeader(
+            version=header.version, point_format=header.point_format
+        )
+        new_header.offsets = header.offsets.copy()
+        new_header.scales = header.scales.copy()
+        provenance.copy_product_vlrs(new_header, header)
+        provenance.copy_header_identity(new_header, header)
+        if self._provenance:
+            provenance.fill_las_header(new_header, self._provenance)
+        return new_header
 
     def _open_tile_writer(self, tid: int):
         """Create a fresh writer, or reopen an evicted tile with append.
@@ -484,21 +607,23 @@ class LiDARTiler:
             out_path = self.output_dir / f"{index}.{self.output_format}"
             self._tile_paths[tid] = out_path
         if out_path.exists() and out_path.stat().st_size > 0:
+            # Append-reopen of an evicted tile: the LAZ stream resumes, but
+            # the chunk table is re-read, so this gets pricier as tiles grow
+            # (counted for the throughput diagnostic).
+            with self._writers_lock:
+                self._tm_reopens += 1
             return laspy.open(
                 str(out_path), mode="a", laz_backend=self._backend
             )
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        header = self._source_header
-        new_header = laspy.LasHeader(
-            version=header.version, point_format=header.point_format
-        )
-        new_header.offsets = header.offsets.copy()
-        new_header.scales = header.scales.copy()
-        provenance.copy_product_vlrs(new_header, header)
-        provenance.copy_header_identity(new_header, header)
-        if self._provenance:
-            provenance.fill_las_header(new_header, self._provenance)
+        template = self._tile_header_template
+        if template is None:
+            # Lazily built once (duplicate builds across threads are
+            # benign: identical and idempotent).
+            template = self._build_tile_header()
+            self._tile_header_template = template
+        new_header = template.copy()
         return laspy.open(
             str(out_path), mode="w", header=new_header, laz_backend=self._backend
         )
@@ -524,6 +649,8 @@ class LiDARTiler:
                 return existing
             lru = order.pop(0) if len(writers) >= self._writer_cap and order else None
             evicted = writers.pop(lru, None) if lru is not None else None
+            if evicted is not None:
+                self._tm_evictions += 1
 
         if evicted is not None:
             self._close_writer(lru, evicted)
@@ -536,14 +663,23 @@ class LiDARTiler:
 
     def _close_writer(self, tid: int, writer: Any) -> None:
         with self._tile_lock(tid):
+            t0 = time.monotonic()
             try:
                 writer.close()
             except Exception as e:
                 logger.warning(f"[Tiler] error closing writer {tid}: {e}")
+            with self._tm_sample_lock:
+                self._tm_close_s += time.monotonic() - t0
 
     def _write_points_to_tile(self, tid: int, data_chunks: list[np.ndarray]) -> None:
         with self._tile_lock(tid):
+            with self._tm_sample_lock:
+                self._tm_sample_n += 1
+                sample = (self._tm_sample_n % _TM_SAMPLE_EVERY) == 0
+            t_open = time.monotonic() if sample else 0.0
             writer = self._get_tile_writer(tid)
+            if sample:
+                t_write = time.monotonic()
             header = writer.header
             write_fn = getattr(writer, "write_points", None)
             if write_fn is None:
@@ -558,13 +694,20 @@ class LiDARTiler:
                     offsets=header.offsets,
                 )
                 write_fn(record)
+            if sample:
+                with self._tm_sample_lock:
+                    self._tm_sample_open_s += t_write - t_open
+                    self._tm_sample_write_s += time.monotonic() - t_write
 
     def _async_write_laz(self, tid: int, mem_buf: dict, io_futures: list) -> None:
         # Pass the buffered chunk list directly; the worker emits each chunk
         # with its own record, so we never materialize a ~2x transient copy.
         chunks = mem_buf[tid]
         mem_buf[tid] = []
+        t0 = time.monotonic()
         self._io_semaphore.acquire()
+        self._tm_io_stall_s += time.monotonic() - t0
+        self._tm_flushes += 1
         future = self._io_executor.submit(
             self._write_points_to_tile, tid, chunks
         )
@@ -724,15 +867,152 @@ class LiDARTiler:
             # Generator close (e.g. the caller cancelled mid-pass) lets the
             # executor finish only the already submitted (finite) spans.
 
+    def _reset_telemetry(self) -> None:
+        """Zero the phase-0 throughput counters (diagnostic only)."""
+        self._tm_evictions = 0
+        self._tm_reopens = 0
+        self._tm_flushes = 0
+        self._tm_flush_scan_total = 0
+        self._tm_flush_scan_max = 0
+        self._tm_io_stall_s = 0.0
+        self._tm_chunks = 0
+        self._tm_log_next = 0
+        self._tm_log_t0 = 0.0
+        self._tm_log_last_pts = 0
+        self._tm_log_last_t = 0.0
+        self._tm_sample_n = 0
+        self._tm_sample_open_s = 0.0
+        self._tm_sample_write_s = 0.0
+        self._tm_close_s = 0.0
+
+    def _telemetry_snapshot(self) -> dict:
+        """Current counters as a manifest-safe dict (rounded floats)."""
+        sample_open_s, sample_write_s, close_s = self._sample_means()
+        with self._tm_sample_lock:
+            sample_n = int(self._tm_sample_n)
+        return {
+            "writer_evictions": int(self._tm_evictions),
+            "writer_reopens": int(self._tm_reopens),
+            "flush_count": int(self._tm_flushes),
+            "flush_scan_total": int(self._tm_flush_scan_total),
+            "flush_scan_max": int(self._tm_flush_scan_max),
+            "io_stall_s": round(float(self._tm_io_stall_s), 3),
+            "chunks": int(self._tm_chunks),
+            "sample_n": sample_n,
+            "sample_open_s": round(float(sample_open_s), 3),
+            "sample_write_s": round(float(sample_write_s), 3),
+            "close_s": round(float(close_s), 3),
+            "merged_supertiles": len(self._merge_supers),
+        }
+
+    def _sample_means(self) -> tuple[float, float, float]:
+        """Single locked read of the sampled open/write/close accumulators."""
+        with self._tm_sample_lock:
+            return (
+                float(self._tm_sample_open_s),
+                float(self._tm_sample_write_s),
+                float(self._tm_close_s),
+            )
+
+    def _log_throughput(self, processed_pts: int, total_pts: int) -> None:
+        """INFO progress legs (overall + since last leg) for huge files.
+
+        Cheap (bounded line count per run): lets an operator watch whether
+        throughput holds or collapses mid-file instead of guessing from a
+        frozen percent counter. Percent milestones alone spread apart in
+        time exactly when the run slows down, so legs also fire on a fixed
+        cadence. Every leg is appended to ``tiling_telemetry.jsonl`` next
+        to the tiles (crash-safe open/append/close): killing or cancelling
+        the run keeps the legs recorded so far — no manual note-taking.
+        """
+        if total_pts <= 0:
+            return
+        now = time.monotonic()
+        if self._tm_log_t0 <= 0.0:
+            self._tm_log_t0 = now
+            self._tm_log_last_t = now
+            self._tm_log_next = max(total_pts // 10, 1)
+            try:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                leg_path = self.output_dir / "tiling_telemetry.jsonl"
+                if leg_path.is_file():
+                    leg_path.unlink()
+            except OSError:
+                pass
+        pct = 100.0 * processed_pts / total_pts
+        due = (
+            (now - self._tm_log_last_t) >= _TILING_LEG_SECONDS
+            or processed_pts >= self._tm_log_next
+            or processed_pts >= total_pts
+        )
+        if not due:
+            return
+        overall = processed_pts / max(now - self._tm_log_t0, 1e-9)
+        leg_pts = processed_pts - self._tm_log_last_pts
+        leg = leg_pts / max(now - self._tm_log_last_t, 1e-9)
+        logger.info(
+            "[Tiler] %s/%s pts (%.0f%%) — %.1fM pts/s overall, "
+            "%.1fM pts/s this leg",
+            f"{processed_pts:,}",
+            f"{total_pts:,}",
+            pct,
+            overall / 1e6,
+            leg / 1e6,
+        )
+        sample_open_s, sample_write_s, close_s = self._sample_means()
+        self._append_leg({
+            "src": self.tag or "",
+            "t_s": round(now - self._tm_log_t0, 1),
+            "points": int(processed_pts),
+            "total": int(total_pts),
+            "pct": round(pct, 2),
+            "overall_m_pts_s": round(overall / 1e6, 3),
+            "leg_m_pts_s": round(leg / 1e6, 3),
+            "tiles": len(self._tile_counts),
+            "evictions": int(self._tm_evictions),
+            "reopens": int(self._tm_reopens),
+            "flushes": int(self._tm_flushes),
+            "io_stall_s": round(float(self._tm_io_stall_s), 3),
+            "sample_open_s": round(float(sample_open_s), 3),
+            "sample_write_s": round(float(sample_write_s), 3),
+            "close_s": round(float(close_s), 3),
+        })
+        self._tm_log_last_pts = processed_pts
+        self._tm_log_last_t = now
+        self._tm_log_next = processed_pts + max(total_pts // 10, 1)
+
+    def _append_leg(self, record: dict) -> None:
+        """Append one JSONL diagnostic leg (crash-safe: open/append/close).
+
+        A killed or cancelled run keeps every leg recorded so far, so the
+        slowdown is diagnosable without re-running to completion.
+        """
+        try:
+            with open(
+                self.output_dir / "tiling_telemetry.jsonl",
+                "a",
+                encoding="utf-8",
+            ) as fh:
+                fh.write(json.dumps(record) + "\n")
+        except OSError:
+            pass
+
     def _process(self, cancel_flag=None) -> TilingResult:
         grid = self._read_grid()
         self._aborted = False
+        self._reset_telemetry()
+        self._merge_on = int(self.merge_floor) > 0
+        self._merge_base_counts = {}
+        self._merge_map = None
+        self._merge_supers = {}
 
         levels = None
         if self.max_points > 0:
             levels = self._density_pass(grid, cancel_flag)
             if levels is None:
                 self._aborted = True
+        if not self._aborted:
+            self._plan_merge(grid, levels, cancel_flag)
         if not self._aborted:
             self._assign_pass(grid, levels, cancel_flag)
         return self._finalize(grid, cancel_flag)
@@ -809,6 +1089,17 @@ class LiDARTiler:
                     # subdivision levels are unchanged.
                     vals, counts = np.unique(flat, return_counts=True)
                     hist[vals] += counts
+                    if self._merge_on:
+                        # Base-level counts for the sparse-merge map (free
+                        # ride on this pass; buffer-expanded like routing).
+                        for bv, bc in zip(*np.unique(
+                            np.asarray(base), return_counts=True
+                        )):
+                            key = int(bv)
+                            self._merge_base_counts[key] = (
+                                self._merge_base_counts.get(key, 0)
+                                + int(bc)
+                            )
 
             processed_pts += len(chunk)
             if self.progress_callback:
@@ -830,6 +1121,93 @@ class LiDARTiler:
                 levels_out = np.minimum(levels_out, candidate)
         self._sub_levels = {int(i): int(v) for i, v in enumerate(levels_out)}
         return levels_out
+
+    # -- Sparse-merge planning ------------------------------------------------
+
+    def _counting_pass(
+        self, grid: dict, cancel_flag=None
+    ) -> dict[int, int] | None:
+        """Stream once counting buffer-expanded points per base tile.
+
+        Sparse-dict based (only touched bases): bounded by the nonempty
+        count, never by grid size. Feeds the sparse-merge map when the
+        density pass did not run (no subdivision cap). Returns None on
+        cancellation. Progress reports on the same point scale as the
+        other passes so the percent counter advances monotonically.
+        """
+        cols = grid["cols"]
+        rows = grid["rows"]
+        T = grid["tile_size"]
+        x_min, y_min = grid["x_min"], grid["y_min"]
+        total_pts = int(self._source_header.point_count)
+        processed_pts = 0
+        counts: dict[int, int] = {}
+        for chunk in self._iter_chunks(cancel_flag):
+            if cancel_flag is not None and cancel_flag():
+                return None
+            x = np.array(chunk.x)
+            y = np.array(chunk.y)
+            c_lo = np.floor((x - x_min - self.buffer_m) / T).astype(
+                np.int64).clip(0, cols - 1)
+            c_hi = np.floor((x - x_min + self.buffer_m) / T).astype(
+                np.int64).clip(0, cols - 1)
+            r_lo = np.floor((y - y_min - self.buffer_m) / T).astype(
+                np.int64).clip(0, rows - 1)
+            r_hi = np.floor((y - y_min + self.buffer_m) / T).astype(
+                np.int64).clip(0, rows - 1)
+            for dc in range(2):
+                for dr in range(2):
+                    mask = (c_lo + dc <= c_hi) & (r_lo + dr <= r_hi)
+                    if not mask.any():
+                        continue
+                    base = (r_lo[mask] + dr) * cols + (c_lo[mask] + dc)
+                    for bv, bc in zip(
+                        *np.unique(base, return_counts=True)
+                    ):
+                        key = int(bv)
+                        counts[key] = counts.get(key, 0) + int(bc)
+            processed_pts += len(chunk)
+            if self.progress_callback:
+                self.progress_callback(processed_pts, total_pts)
+        return counts
+
+    def _plan_merge(self, grid, levels, cancel_flag) -> None:
+        """Build the sparse-merge routing map (no-op unless enabled).
+
+        Counts ride the density pass when subdividing, else come from a
+        light counting pass (+1 streaming read, documented cost).
+        Subdivided bases lock their ancestors. Sets ``_merge_map``
+        (base -> origin, identity for unmapped) and ``_merge_supers``
+        (origin -> block meta with negative super tid).
+        """
+        self._merge_map = None
+        self._merge_supers = {}
+        if not self._merge_on:
+            return
+        cols = grid["cols"]
+        rows = grid["rows"]
+        if levels is not None:
+            base_counts = dict(self._merge_base_counts)
+            subdivided = {
+                b for b, level in self._sub_levels.items() if level > 0
+            }
+        else:
+            base_counts = self._counting_pass(grid, cancel_flag)
+            if base_counts is None:
+                self._aborted = True
+                return
+            subdivided = set()
+        super_of, blocks = plan_sparse_merge(
+            base_counts, subdivided, cols=cols, rows=rows,
+            floor=int(self.merge_floor),
+        )
+        self._merge_map = super_of
+        for origin, block in blocks.items():
+            self._merge_supers[origin] = {
+                "span": block["span"],
+                "points": block["points"],
+                "super_tid": -(origin + 1),
+            }
 
     # -- Pass B: assignment ----------------------------------------------
 
@@ -871,6 +1249,13 @@ class LiDARTiler:
         tile_mem_buffer: dict[int, list[np.ndarray]] = {}
         tile_mem_counts: dict[int, int] = {}
         tile_mem_bytes: dict[int, int] = {}
+        # Tiles holding unflushed points, in first-touch order. The per-chunk
+        # flush scan walks this map — never the whole tile universe (the
+        # historical full-dict walk was O(tiles x chunks) and dragged late
+        # runs over sparse grids). Insertion order is language-guaranteed,
+        # so flush sequencing stays deterministic across machines (a set
+        # would not: flush order moves LAZ chunk boundaries, i.e. bytes).
+        pending: dict[int, None] = {}
         buffered_total = 0
         buffered_bytes = 0
         memory_budget_bytes = self.memory_budget_bytes
@@ -1001,7 +1386,52 @@ class LiDARTiler:
                 groups = [xp.asnumpy(group) for group in groups]
                 u_tids = xp.asnumpy(u_tids)
 
-            for tid_val, group in zip(u_tids, groups):
+            if self._merge_map is not None:
+                # Sparse merge: remap base groups into super buckets at
+                # group granularity. Points shared by sibling bases collapse
+                # once here so a source point lands exactly once per tile
+                # file. Group order is already tid-sorted and unique()
+                # sorts within a bucket: deterministic. Buckets keyed by
+                # negative super tid can never collide with base/sub tids;
+                # unmapped tids (unmerged bases, real sub-tiles) pass
+                # through untouched. In subdivided mode sub-tids may share
+                # numerals with base ids, so only level-0 (sub == 0) groups
+                # consult the map.
+                merge_map = self._merge_map
+                merge_supers = self._merge_supers
+                subdivided_mode = bool(self._subdivided)
+                super_buckets: dict[int, list] = {}
+                super_order: list[int] = []
+                for tid_val, group in zip(u_tids, groups):
+                    key = int(tid_val)
+                    if subdivided_mode:
+                        base, sub = divmod(key, 256)
+                        if sub == 0:
+                            origin = merge_map.get(base, base)
+                            info = merge_supers.get(origin)
+                            if info is not None:
+                                key = info["super_tid"]
+                    else:
+                        origin = merge_map.get(key, key)
+                        info = merge_supers.get(origin)
+                        if info is not None:
+                            key = info["super_tid"]
+                    if key not in super_buckets:
+                        super_buckets[key] = []
+                        super_order.append(key)
+                    super_buckets[key].append(group)
+                regrouped: list[tuple[int, object]] = []
+                for sup in super_order:
+                    parts = super_buckets[sup]
+                    if len(parts) == 1:
+                        regrouped.append((sup, parts[0]))
+                    else:
+                        regrouped.append(
+                            (sup, np.unique(np.concatenate(parts))))
+                work = regrouped
+            else:
+                work = list(zip(u_tids, groups))
+            for tid_val, group in work:
                 tid_i = int(tid_val)
                 if tid_i not in tile_mem_buffer:
                     tile_mem_buffer[tid_i] = []
@@ -1012,7 +1442,14 @@ class LiDARTiler:
                         "max": np.array([-np.inf] * 3),
                     }
                     self._tile_counts[tid_i] = 0
-                    if self._subdivided:
+                    if tid_i < 0:
+                        origin = -tid_i - 1
+                        info = self._merge_supers[origin]
+                        self._tid_index[tid_i] = TileIndex(
+                            origin % cols, origin // cols, self.tag,
+                            span=info["span"],
+                        )
+                    elif self._subdivided:
                         base_tid = tid_i // 256
                         sub_idx = tid_i % 256
                         level_i = self._sub_levels.get(base_tid, 0)
@@ -1041,6 +1478,7 @@ class LiDARTiler:
                 tile_mem_counts[tid_i] += group.size
                 self._tile_counts[tid_i] += group.size
                 tile_mem_bytes[tid_i] += group_bytes
+                pending[tid_i] = None
                 buffered_total += group.size
                 buffered_bytes += group_bytes
                 stats_x = xp.asnumpy(x[group]) if (xp is not None and not self._subdivided) else x[group]
@@ -1050,30 +1488,46 @@ class LiDARTiler:
                     self._tile_stats[tid_i], stats_x, stats_y, stats_z
                 )
 
-            # Flush tiles that reached their per-tile threshold.
-            for tid_i, count in list(tile_mem_counts.items()):
+            # Flush tiles that reached their per-tile threshold. The scan
+            # walks only tiles with pending points — never the whole tile
+            # universe (the historical full-dict walk was O(tiles x chunks)
+            # and dragged late runs over sparse grids with hundreds of
+            # thousands of micro-tiles).
+            scan = len(pending)
+            self._tm_flush_scan_total += scan
+            if scan > self._tm_flush_scan_max:
+                self._tm_flush_scan_max = scan
+            for tid_i in list(pending):
+                count = tile_mem_counts[tid_i]
                 if count >= self._buffer_flush:
                     self._async_write_laz(tid_i, tile_mem_buffer, io_futures)
                     buffered_total -= count
                     buffered_bytes -= tile_mem_bytes[tid_i]
                     tile_mem_counts[tid_i] = 0
                     tile_mem_bytes[tid_i] = 0
+                    pending.pop(tid_i, None)
 
             # Flush while the global buffered-BYTE budget is exceeded.
             # Picking the heaviest bucket keeps peak RAM bounded without
             # burning the writer queue on many tiny partial tiles.
             while buffered_bytes > memory_budget_bytes:
-                tid_big = max(tile_mem_bytes, key=tile_mem_bytes.get)
+                if not pending:
+                    break
+                tid_big = max(pending, key=tile_mem_bytes.get)
                 count_big = tile_mem_counts[tid_big]
                 if count_big == 0:
-                    break
+                    pending.pop(tid_big, None)
+                    continue
                 self._async_write_laz(tid_big, tile_mem_buffer, io_futures)
                 buffered_total -= count_big
                 buffered_bytes -= tile_mem_bytes[tid_big]
                 tile_mem_counts[tid_big] = 0
                 tile_mem_bytes[tid_big] = 0
+                pending.pop(tid_big, None)
 
             processed_pts += len(chunk)
+            self._tm_chunks += 1
+            self._log_throughput(processed_pts, total_pts)
             if self.progress_callback:
                 self.progress_callback(processed_pts, total_pts)
             logger.debug(f"[Tiler] {processed_pts / total_pts:.1%} — {processed_pts:,} pts")
@@ -1089,6 +1543,7 @@ class LiDARTiler:
         for tid in list(tile_mem_buffer.keys()):
             if tile_mem_buffer[tid]:
                 self._async_write_laz(tid, tile_mem_buffer, io_futures)
+                pending.pop(tid, None)
 
         # Surface async write failures: a disk/handle error must fail the run
         # instead of leaving silently truncated tiles.
@@ -1103,6 +1558,7 @@ class LiDARTiler:
         else:
             possible = cols * rows
         grid["possible"] = possible
+        logger.info("[Tiler] telemetry: %s", self._telemetry_snapshot())
 
     # -- Finalization -----------------------------------------------------
 
@@ -1151,7 +1607,9 @@ class LiDARTiler:
             x0 = grid["x_min"] + index.col * T
             y0 = grid["y_min"] + index.row * T
             w = T
-            if index.sub_level:
+            if index.span > 1:
+                w = T * index.span
+            elif index.sub_level:
                 s = 1 << index.sub_level
                 side = T / s
                 x0 += index.sub_col * side
@@ -1166,6 +1624,7 @@ class LiDARTiler:
                     "sub_level": int(index.sub_level),
                     "sub_row": int(index.sub_row),
                     "sub_col": int(index.sub_col),
+                    "span": int(index.span),
                     "point_count": count,
                     "file_size": tile_size,
                     "x_min": float(stats["min"][0]),
@@ -1177,6 +1636,13 @@ class LiDARTiler:
                     "core_y_min": y0,
                     "core_x_max": x0 + w,
                     "core_y_max": y0 + w,
+                    # Tiling-grid anchor for raster registration: tile
+                    # raster grids snap outward to res multiples from this
+                    # origin (tile_transform), so fragments at ANY
+                    # resolution share one exact grid and merge without
+                    # resampling. Same origin for base, span and sub tiles.
+                    "grid_ox": float(grid["x_min"]),
+                    "grid_oy": float(grid["y_min"]),
                 }
             )
 
@@ -1192,6 +1658,14 @@ class LiDARTiler:
         source_meta["dimension_ranges"] = ranges
 
         possible = grid.get("possible", cols * rows)
+        if self._merge_map is not None:
+            # Merged runs count empty BASE cells (fused cells are not
+            # "skipped": their points live in a supertile). The legacy
+            # files-based formula below is untouched when merging is off.
+            skipped_empty = max(0, cols * rows - len(set(self._merge_map)))
+        else:
+            skipped_empty = int(max(0, possible - len(final_info)))
+        final_info = backfill_grid_anchor(final_info, float(self.tile_size))
         result = TilingResult(
             source_file=str(self.source_path.absolute()),
             output_dir=str(self.output_dir.absolute()),
@@ -1202,13 +1676,14 @@ class LiDARTiler:
             tile_size_m=float(self.tile_size),
             buffer_m=float(self.buffer_m),
             max_points_per_tile=int(self.max_points),
+            merge_sparse_below=int(self.merge_floor),
             max_subdivision=int(
                 max((self._sub_levels.get(tid, 0) for tid in self._nonempty_bases), default=0)
                 if self._subdivided
                 else 0
             ),
             tiles_generated=final_info,
-            tiles_skipped_empty=int(max(0, possible - len(final_info))),
+            tiles_skipped_empty=skipped_empty,
             source_meta=source_meta,
             flag_counts=dict(self._flag_counts),
             density_counts={
@@ -1216,6 +1691,7 @@ class LiDARTiler:
                 "class_histogram": dict(self._density_class),
                 "return_histogram": dict(self._density_returns),
             },
+            tiling_telemetry=self._telemetry_snapshot(),
         )
         result_json = result.to_json()
         manifest = json.loads(result_json)

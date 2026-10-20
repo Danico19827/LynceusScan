@@ -15,6 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 from lynceus.ui.runs_panel import (
     _is_session_dir,
     _iter_cache_files,
@@ -194,6 +196,13 @@ class GroupOriginsTests(unittest.TestCase):
 
 
 class SessionBadgeTests(unittest.TestCase):
+    def _write_meta(self, sess: Path, meta: dict) -> None:
+        import json
+
+        (sess / "session_meta.json").write_text(
+            json.dumps(meta), encoding="utf-8"
+        )
+
     def test_badge_with_quality_report(self) -> None:
         import json
 
@@ -211,7 +220,114 @@ class SessionBadgeTests(unittest.TestCase):
             )
             self.assertEqual(
                 RunsPanel._session_badge(sess),
-                "20260101_000000 · PASS · 4 products",
+                "PASS · 20260101_000000 · 4 products",
+            )
+
+    def test_badge_adds_source_from_meta(self) -> None:
+        import json
+
+        from lynceus.ui.runs_panel import RunsPanel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = Path(tmp) / "20260101_000000"
+            sess.mkdir()
+            (sess / "quality_report.json").write_text(
+                json.dumps({
+                    "verdict": "PASS",
+                    "counts": {"products_written": 4},
+                }),
+                encoding="utf-8",
+            )
+            self._write_meta(sess, {
+                "pipeline_status": "completed",
+                "source_file": "",
+                "sources": [{"iid": "a1", "file": "/data/vuelo.laz"}],
+            })
+            self.assertEqual(
+                RunsPanel._session_badge(sess),
+                "PASS · 20260101_000000 · vuelo.laz · 4 products",
+            )
+
+    def test_badge_running_status_without_report(self) -> None:
+        from lynceus.ui.runs_panel import RunsPanel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = Path(tmp) / "20260101_000000"
+            sess.mkdir()
+            self._write_meta(sess, {
+                "pipeline_status": "running",
+                "sources": [{"iid": "a1", "file": "/data/vuelo.laz"}],
+            })
+            self.assertEqual(
+                RunsPanel._session_badge(sess),
+                "RUNNING · 20260101_000000 · vuelo.laz",
+            )
+
+    def test_badge_verdict_beats_meta_status(self) -> None:
+        import json
+
+        from lynceus.ui.runs_panel import RunsPanel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = Path(tmp) / "20260101_000000"
+            sess.mkdir()
+            (sess / "quality_report.json").write_text(
+                json.dumps({"verdict": "FAIL", "counts": {}}),
+                encoding="utf-8",
+            )
+            self._write_meta(sess, {"pipeline_status": "completed"})
+            self.assertEqual(
+                RunsPanel._session_badge(sess),
+                "FAIL · 20260101_000000",
+            )
+
+    def test_badge_cancelled_beats_fail_verdict(self) -> None:
+        import json
+
+        from lynceus.ui.runs_panel import RunsPanel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = Path(tmp) / "20260101_000000"
+            sess.mkdir()
+            (sess / "quality_report.json").write_text(
+                json.dumps({"verdict": "FAIL", "counts": {}}),
+                encoding="utf-8",
+            )
+            self._write_meta(sess, {"pipeline_status": "cancelled"})
+            self.assertEqual(
+                RunsPanel._session_badge(sess),
+                "CANCELLED · 20260101_000000",
+            )
+
+    def test_badge_multi_source_lists_two_plus_count(self) -> None:
+        from lynceus.ui.runs_panel import RunsPanel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = Path(tmp) / "20260101_000000"
+            sess.mkdir()
+            self._write_meta(sess, {
+                "pipeline_status": "completed",
+                "sources": [
+                    {"file": "/d/a.laz"},
+                    {"file": "/d/b.laz"},
+                    {"file": "/d/c.laz"},
+                ],
+            })
+            self.assertEqual(
+                RunsPanel._session_badge(sess),
+                "COMPLETED · 20260101_000000 · a.laz, b.laz +1",
+            )
+
+    def test_badge_tolerates_corrupt_metadata(self) -> None:
+        from lynceus.ui.runs_panel import RunsPanel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = Path(tmp) / "20260101_000000"
+            sess.mkdir()
+            (sess / "quality_report.json").write_bytes(b"not json")
+            (sess / "session_meta.json").write_bytes(b"[[[")
+            self.assertEqual(
+                RunsPanel._session_badge(sess), "20260101_000000"
             )
 
     def test_badge_without_report_is_plain(self) -> None:
@@ -398,6 +514,155 @@ class PanelSignalsTests(unittest.TestCase):
             {"errors": 1, "files": 205922, "freed": 68907621167,
              "cancelled": True},
         )
+
+
+class CollapsedTreeTests(unittest.TestCase):
+    """Item 41: sessions list collapsed in one line; files load on expand."""
+
+    def setUp(self) -> None:
+        from unittest.mock import PropertyMock, patch
+
+        from PySide6.QtWidgets import QApplication
+
+        from lynceus.ui.runs_panel import RunsPanel
+
+        self._app = QApplication.instance() or QApplication([])
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self._sessions: dict[str, Path] = {}
+        for name, with_report in (
+            ("20260101_000000", True),
+            ("20260102_000000", False),
+        ):
+            sess = self.root / "proj" / "src" / name
+            (sess / "artifacts").mkdir(parents=True)
+            (sess / "artifacts" / "dtm_mosaic.tif").write_bytes(b"tif")
+            (sess / "provenance.json").write_bytes(b"{}")
+            import json
+
+            (sess / "session_meta.json").write_text(
+                json.dumps({
+                    "pipeline_status": "completed",
+                    "sources": [{"iid": "a1", "file": "/data/vuelo.laz"}],
+                }),
+                encoding="utf-8",
+            )
+            if with_report:
+                (sess / "quality_report.json").write_text(
+                    json.dumps({
+                        "verdict": "PASS",
+                        "counts": {"products_written": 4},
+                    }),
+                    encoding="utf-8",
+                )
+            # Deterministic newest-first order (collect sorts by mtime).
+            stamp = 1_700_000_000 + int(name[6:8])
+            os.utime(sess, (stamp, stamp))
+            self._sessions[name] = sess
+        self._patcher = patch.object(
+            RunsPanel, "_always_root",
+            new_callable=PropertyMock, return_value=self.root,
+        )
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+        self.panel = RunsPanel()
+        self.addCleanup(self.panel.shutdown)
+        self.addCleanup(self.panel.deleteLater)
+        self.panel.refresh()
+
+    def _row(self, path: Path):
+        """Tree item holding a path, or None."""
+        from PySide6.QtCore import Qt
+
+        role = Qt.ItemDataRole.UserRole
+        stack = [
+            self.panel.tree.topLevelItem(i)
+            for i in range(self.panel.tree.topLevelItemCount())
+        ]
+        while stack:
+            item = stack.pop()
+            if item.data(0, role) == str(path):
+                return item
+            for i in range(item.childCount()):
+                stack.append(item.child(i))
+        return None
+
+    def test_counters_live_only_at_root(self) -> None:
+        root = self.panel.tree.topLevelItem(0)
+        self.assertTrue(root.text(0).endswith("[Runs: 2]"))
+        group = root.child(0)
+        self.assertEqual(group.text(0), "proj")
+        source = group.child(0)
+        self.assertEqual(source.text(0), "src")
+
+    def test_sessions_collapsed_in_one_line(self) -> None:
+        for name, _ in (("20260101_000000", 0), ("20260102_000000", 1)):
+            row = self._row(self._sessions[name])
+            self.assertIsNotNone(row)
+            self.assertFalse(row.isExpanded())
+            self.assertEqual(row.childCount(), 0)
+        self.assertEqual(
+            self._row(self._sessions["20260101_000000"]).text(0),
+            "PASS · 20260101_000000 · vuelo.laz · 4 products",
+        )
+        self.assertEqual(
+            self._row(self._sessions["20260102_000000"]).text(0),
+            "COMPLETED · 20260102_000000 · vuelo.laz",
+        )
+
+    def test_newest_chain_expanded_down_to_session(self) -> None:
+        root = self.panel.tree.topLevelItem(0)
+        self.assertTrue(root.isExpanded())
+        self.assertTrue(root.child(0).isExpanded())
+        self.assertTrue(root.child(0).child(0).isExpanded())
+        newest = self._row(self._sessions["20260102_000000"])
+        self.assertFalse(newest.isExpanded())
+
+    def test_expand_loads_files_once(self) -> None:
+        row = self._row(self._sessions["20260101_000000"])
+        row.setExpanded(True)
+        names = sorted(row.child(i).text(0) for i in range(row.childCount()))
+        self.assertEqual(
+            names,
+            ["artifacts", "provenance.json", "quality_report.json",
+             "session_meta.json"],
+        )
+        count = row.childCount()
+        row.setExpanded(False)
+        row.setExpanded(True)
+        self.assertEqual(row.childCount(), count)
+
+    def test_empty_session_loses_expander(self) -> None:
+        from PySide6.QtWidgets import QTreeWidgetItem
+
+        empty = self.root / "proj" / "src" / "20260103_000000"
+        empty.mkdir(parents=True)
+        os.utime(empty, (1_700_000_099, 1_700_000_099))
+        self.panel.refresh()
+        row = self._row(empty)
+        self.assertIsNotNone(row)
+        row.setExpanded(True)
+        self.assertEqual(row.childCount(), 0)
+        self.assertEqual(
+            row.childIndicatorPolicy(),
+            QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicator,
+        )
+
+    def test_file_selection_survives_refresh(self) -> None:
+        row = self._row(self._sessions["20260101_000000"])
+        row.setExpanded(True)
+        target = self._sessions["20260101_000000"] / "artifacts"
+        leaf = self._row(target)
+        self.assertIsNotNone(leaf)
+        self.panel.tree.setCurrentItem(leaf)
+        self.panel.refresh()
+        current = self.panel.tree.currentItem()
+        self.assertIsNotNone(current)
+        from PySide6.QtCore import Qt
+
+        self.assertEqual(
+            current.data(0, Qt.ItemDataRole.UserRole), str(target))
 
 
 if __name__ == "__main__":

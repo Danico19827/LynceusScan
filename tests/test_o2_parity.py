@@ -68,6 +68,16 @@ class MedianNodataParityTests(unittest.TestCase):
 
 
 class RasterGridBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Refusals retry with backoff in production; tests assert the
+        # refusal itself, not the wait.
+        import lynceus.processing.raster as _raster
+
+        self._retry_s = _raster._GRID_BUDGET_RETRY_S
+        _raster._GRID_BUDGET_RETRY_S = 0.0
+        self.addCleanup(setattr, _raster, "_GRID_BUDGET_RETRY_S",
+                        self._retry_s)
+
     def test_normal_tile_grid_keeps_dimensions(self) -> None:
         _, cols, rows = tile_transform(
             _tile_dict(), 1.0, memory_budget_bytes=1024 * 1024
@@ -116,6 +126,42 @@ class RasterGridBudgetTests(unittest.TestCase):
                         memory_budget_bytes=1024 * 1024,
                         tile_id="probe",
                     )
+
+    def test_floor_survives_zero_free_ram(self) -> None:
+        import lynceus.processing.raster as _raster
+
+        real = _raster._free_bytes_now
+        _raster._free_bytes_now = lambda: 0
+        self.addCleanup(setattr, _raster, "_free_bytes_now", real)
+        budget, detail = _raster._stable_grid_budget(1024 ** 3)
+        self.assertEqual(budget, _raster._GRID_BUDGET_FLOOR_BYTES)
+        self.assertIn("configured=", detail)
+        # A 421x421 PMF-style grid (~17 MiB estimate) still admits.
+        _raster._admit_grid(17 * 1024 * 1024, 1024 ** 3, "probe grid")
+
+    def test_transient_pressure_waits_then_proceeds(self) -> None:
+        import lynceus.processing.raster as _raster
+
+        calls = {"n": 0}
+
+        def _free():
+            calls["n"] += 1
+            return 0 if calls["n"] < 3 else 8 * 1024 ** 3
+
+        real = _raster._free_bytes_now
+        _raster._free_bytes_now = _free
+        self.addCleanup(setattr, _raster, "_free_bytes_now", real)
+        _raster._admit_grid(100 * 1024 * 1024, 1024 ** 3, "probe grid")
+        self.assertGreaterEqual(calls["n"], 3)
+
+    def test_genuine_exhaustion_reports_numbers(self) -> None:
+        import lynceus.processing.raster as _raster
+
+        real = _raster._free_bytes_now
+        _raster._free_bytes_now = lambda: 0
+        self.addCleanup(setattr, _raster, "_free_bytes_now", real)
+        with self.assertRaisesRegex(ValueError, "MiB.*configured="):
+            _raster._admit_grid(10 * 1024 ** 3, 1024 ** 3, "probe grid")
 
 
 class ReducerParityTests(unittest.TestCase):

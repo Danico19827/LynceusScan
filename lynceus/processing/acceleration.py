@@ -143,6 +143,23 @@ def available_acceleration_devices() -> list[AccelerationDevice]:
     ]
 
 
+def available_backends() -> list[str]:
+    """Backend ids the selector may offer: CPU plus detected hardware.
+
+    A backend without any detected device never reaches the user, so a
+    machine without a discrete GPU only offers CPU (auto included).
+    """
+    seen = ["auto", "cpu"]
+    for device in available_acceleration_devices():
+        backend = device.backend
+        if backend not in VALID_BACKENDS or backend in seen:
+            continue
+        if backend != "cpu" and not device.available:
+            continue
+        seen.append(backend)
+    return seen
+
+
 def resolve_acceleration(
     mode: str | None = None,
     backend: str | None = None,

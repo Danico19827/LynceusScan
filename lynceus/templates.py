@@ -20,6 +20,7 @@ and the template file itself is never overwritten.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -185,3 +186,68 @@ def template_file_name(name: str) -> str:
     slug = "".join(c if (c.isalnum() or c in ("-", "_", " ")) else "_" for c in name)
     slug = "_".join(slug.split()).strip("_") or "template"
     return f"{slug}{project_io.PROJECT_SUFFIX}"
+
+
+def partition_template_files(doc: dict) -> tuple[list[str], list[str]]:
+    """Split the file paths referenced in a project doc (existing, missing).
+
+    Scans every node config for the generic ``file_path``/``files`` keys the
+    file-backed input widgets capture (Load LAS/LAZ, Input Raster, Input
+    Table/GeoPackage). Order-stable and de-duplicated across nodes; existence
+    is checked on disk. Qt-free, so it doubles as a pure testable helper for
+    the "template on another machine" case (item 45).
+    """
+    seen: set[str] = set()
+    existing: list[str] = []
+    missing: list[str] = []
+    for node in doc.get("nodes", []):
+        config = node.get("config")
+        if not isinstance(config, dict):
+            continue
+        candidates: list[str] = []
+        fp = config.get("file_path")
+        if isinstance(fp, str) and fp:
+            candidates.append(fp)
+        files = config.get("files")
+        if isinstance(files, list):
+            candidates.extend(
+                f for f in files if isinstance(f, str) and f
+            )
+        for path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
+            if os.path.isfile(path):
+                existing.append(path)
+            else:
+                missing.append(path)
+    return existing, missing
+
+
+def strip_missing_files(doc: dict, missing: set[str]) -> int:
+    """Drop missing path references from node configs; returns count removed.
+
+    Leaves every existing path untouched so a template opened on a second
+    device keeps working out of the box for whatever survived; the paths the
+    operator must re-pick are emptied in the config (nodes open file-less)
+    and reported by the caller in one notice.
+    """
+    removed = 0
+    for node in doc.get("nodes", []):
+        config = node.get("config")
+        if not isinstance(config, dict):
+            continue
+        fp = config.get("file_path")
+        if isinstance(fp, str) and fp in missing:
+            config.pop("file_path", None)
+            removed += 1
+        files = config.get("files")
+        if isinstance(files, list):
+            kept = [f for f in files if f not in missing]
+            if len(kept) != len(files):
+                removed += len(files) - len(kept)
+                if kept:
+                    config["files"] = kept
+                else:
+                    config.pop("files", None)
+    return removed

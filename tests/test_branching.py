@@ -169,5 +169,55 @@ class LegalShapesTests(unittest.TestCase):
         self.assertIn("e2|merge", [t.task_id for t in tasks])
 
 
+class PruneNodesTests(unittest.TestCase):
+    """prune_nodes: drop skipped nodes rewiring consumers to providers."""
+
+    def test_chain_rewires_through(self) -> None:
+        from lynceus.processing.steps import prune_nodes
+
+        iids, edges = prune_nodes(
+            ["a", "c", "d"],
+            [("a", "c", "x", "x"), ("c", "d", "y", "y")],
+            {"c"},
+        )
+        self.assertEqual(iids, ["a", "d"])
+        self.assertEqual(edges, [("a", "d", "x", "y")])
+
+    def test_diamond_keeps_types(self) -> None:
+        from lynceus.processing.steps import prune_nodes
+
+        iids, edges = prune_nodes(
+            ["a", "b", "c", "d"],
+            [("a", "c", "x", "x"), ("b", "c", "z", "x"),
+             ("c", "d", "y", "y")],
+            {"c"},
+        )
+        self.assertEqual(iids, ["a", "b", "d"])
+        self.assertEqual(edges, [
+            ("a", "d", "x", "y"), ("b", "d", "z", "y")])
+
+    def test_chained_skips_resolve_transitively(self) -> None:
+        from lynceus.processing.steps import prune_nodes
+
+        iids, edges = prune_nodes(
+            ["a", "c1", "c2", "d"],
+            [("a", "c1", "x", "x"), ("c1", "c2", "y", "y"),
+             ("c2", "d", "z", "z")],
+            {"c1", "c2"},
+        )
+        self.assertEqual(iids, ["a", "d"])
+        self.assertEqual(edges, [("a", "d", "x", "z")])
+
+    def test_consumer_drop_and_empty_noop(self) -> None:
+        from lynceus.processing.steps import prune_nodes
+
+        iids, edges = prune_nodes(
+            ["a", "c"], [("a", "c", "x", "x")], {"c", "a"})
+        self.assertEqual(iids, [])
+        self.assertEqual(edges, [])
+        same_i, same_e = prune_nodes(["a"], [], set())
+        self.assertEqual((same_i, same_e), (["a"], []))
+
+
 if __name__ == "__main__":
     unittest.main()

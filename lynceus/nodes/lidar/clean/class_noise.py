@@ -49,6 +49,9 @@ PROCESSING_SPECS = {
     "passes_flags": ("classified",),
     "point_cloud_dir": "clean_noise",
     "output_globs": ("clean_noise/**/*.laz",),
+    # k-NN builds a cKDTree + a full n×(k+1) distance matrix over the whole
+    # tile: several full-size temporaries beyond the base record array.
+    "tile_weight_factor": 3.0,
     "config_schema": {
         "method": {
             "type": "str",

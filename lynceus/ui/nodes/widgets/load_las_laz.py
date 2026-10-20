@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Taritolay, Nicolás Daniel <lynceusscan@gmail.com>
-import os
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import QFileDialog
 
@@ -12,14 +11,18 @@ from lynceus.ui.nodes.node_item import (
     LABEL_COLOR,
     NodeItem,
 )
+from lynceus.ui.nodes.widgets.file_queue import FileQueueMixin
 
 BUTTON_HEIGHT = 24
 LABEL_LINE_HEIGHT = 16
 MISSING_COLOR = QColor("#d97a7a")  # Error state: inaccessible source.
+LIDAR_FILTERS = "LiDAR files (*.laz *.las)"
 
 
-class LoadLasLazNodeItem(NodeItem):
+class LoadLasLazNodeItem(FileQueueMixin, NodeItem):
     """Node 'Load LAS/LAZ': painted file selector for .laz / .las (UI only)."""
+
+    file_changed = Signal()
 
     def __init__(
         self,
@@ -31,6 +34,7 @@ class LoadLasLazNodeItem(NodeItem):
         parent=None,
     ):
         super().__init__(node_id, node_name, category, inputs, outputs, parent)
+        self._queue_init()
         self._file_path: str | None = None
         self._file_name: str | None = None
         self._file_missing = False
@@ -78,16 +82,8 @@ class LoadLasLazNodeItem(NodeItem):
             painter, self._button_rect(), t("Browse..."), hovered
         )
 
-        if self._file_name:
-            if self._file_missing:
-                text = f"\u26a0 {self._file_name} {t('(file not found)')}"
-                painter.setPen(MISSING_COLOR)
-            else:
-                text = f"\u2713 {self._file_name}"
-                painter.setPen(LABEL_COLOR)
-        else:
-            text = t("No file selected")
-            painter.setPen(LABEL_COLOR)
+        text, missing = self._queue_label_text(t("No file selected"))
+        painter.setPen(MISSING_COLOR if missing else LABEL_COLOR)
         label_rect = self._label_rect()
         font = QFont()
         font.setPointSize(scaled_point_size(9))
@@ -108,12 +104,18 @@ class LoadLasLazNodeItem(NodeItem):
                 t("Tiles: {n}").format(n=self._tile_count),
             )
 
-    def _browse(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            None, t("Select LiDAR file"), "", "LiDAR files (*.laz *.las)"
+    def _browse_files(self) -> list[str]:
+        paths, _ = QFileDialog.getOpenFileNames(
+            None, t("Select LiDAR file"), "", LIDAR_FILTERS
         )
-        if path:
-            self.set_file_path(path)
+        return [str(path) for path in paths or []]
+
+    def _queue_filters(self) -> str:
+        return LIDAR_FILTERS
+
+    def _persist_queue(self, queue: list[str]) -> None:
+        # Flat config is rebuilt from state on capture: nothing to store.
+        return
 
     def file_path(self) -> str | None:
         return self._file_path
@@ -122,19 +124,24 @@ class LoadLasLazNodeItem(NodeItem):
         return self._file_missing
 
     def set_file_path(self, path: str) -> None:
-        self._file_path = path
-        self._file_name = os.path.basename(path)
-        self._file_missing = not os.path.isfile(path)
-        self.update()
+        """Single-file pick (kept for callers; delegates to the queue)."""
+        self.set_file_queue([path] if path else [])
 
     def capture_config(self) -> dict:
         config = super().capture_config()
         if self._file_path:
             config["file_path"] = self._file_path
+        if len(self.file_queue()) > 1:
+            config["files"] = self.file_queue()
         return config
 
     def apply_config(self, config: dict) -> None:
         super().apply_config(config)
         path = config.get("file_path")
-        if isinstance(path, str) and path:
-            self.set_file_path(path)
+        # Re-derive the visible file state from the restored flat config
+        # (no signal: restore must not mark the project modified).
+        self._restore_queue(
+            config.get("files"),
+            path if isinstance(path, str) else None,
+        )
+        self.update()

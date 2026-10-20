@@ -4,7 +4,7 @@ import os
 import uuid
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsObject
 
 from lynceus.nodes.ports import get_display_name, get_port_color, port_metadata
@@ -20,7 +20,7 @@ HEADER_HEIGHT = 30
 ROW_HEIGHT = 18
 ROW_SPACING = 4
 CONTENT_PADDING = 4
-CORNER_RADIUS = 6
+CORNER_RADIUS = 8
 
 FILL = QColor("#1c2333")
 BORDER = QColor("#2f3a4f")
@@ -78,6 +78,8 @@ class NodeItem(QGraphicsObject):
     message_requested = Signal(str)
     label_edit_requested = Signal(object)  # the item itself
     preview_requested = Signal(object)  # file-backed item double-clicked on its body
+    queue_manage_requested = Signal(object)  # queue-capable item menu
+    fleet_action_requested = Signal(object, str)  # item, action string
 
     def __init__(
         self,
@@ -223,6 +225,13 @@ class NodeItem(QGraphicsObject):
     def _toggle_pulse(self) -> None:
         self._pulse_on = not self._pulse_on
         self.update()
+
+    def _spine_color(self) -> QColor:
+        """Data-type identity: first output port color, else first input."""
+        ports = list(self._output_ports) + list(self._input_ports)
+        if ports:
+            return QColor(get_port_color(ports[0].port_type_id))
+        return QColor(BORDER)
 
     def _border_color(self) -> QColor:
         if self._status == STATUS_PROCESSING:
@@ -408,6 +417,28 @@ class NodeItem(QGraphicsObject):
         painter.setBrush(FILL)
         painter.setPen(QPen(border, 1.2))
         painter.drawRoundedRect(frame, CORNER_RADIUS, CORNER_RADIUS)
+        # Header band: same fill lifted in place (derived live, so themes
+        # follow with no extra constant), barely brighter on hover.
+        band_lift = 125 if self._hover_region is not None else 115
+        band = QColor(FILL).lighter(band_lift)
+        painter.setBrush(band)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(
+            QRectF(frame.x() + 2, frame.y() + 2,
+                   frame.width() - 4, HEADER_HEIGHT - 2),
+            CORNER_RADIUS - 2, CORNER_RADIUS - 2,
+        )
+        if self._selected and self._status != STATUS_IDLE:
+            # A successfully run node keeps its status border; the outer
+            # ring carries the selection so multi-selections stay readable
+            # on done/cached/error/processing nodes.
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(BORDER_SELECTED, 2.2))
+            painter.drawRoundedRect(
+                frame.adjusted(-3.5, -3.5, 3.5, 3.5),
+                CORNER_RADIUS + 3.5,
+                CORNER_RADIUS + 3.5,
+            )
 
         self._paint_header(painter, frame)
         accent = self.header_accent()
@@ -426,8 +457,8 @@ class NodeItem(QGraphicsObject):
         self.paint_content(painter, self._content_rect())
 
     def header_accent(self) -> QColor | None:
-        """Accent line under the header (None = no line)."""
-        return None
+        """Hairline under the header in the dominant port color."""
+        return self._spine_color()
 
     def _paint_header(self, painter: QPainter, frame: QRectF) -> None:
         category_font = self._font(7.5, bold=True)
@@ -458,6 +489,12 @@ class NodeItem(QGraphicsObject):
         hovered = self._hovered_port is port
         base = QColor(get_port_color(port.port_type_id))
         if hovered:
+            halo = QColor(base)
+            halo.setAlpha(60)
+            painter.setBrush(halo)
+            painter.setPen(Qt.PenStyle.NoPen)
+            halo_r = PORT_DOT_SIZE / 2 + 3
+            painter.drawEllipse(center, halo_r, halo_r)
             fill, border = DOT_HOVER, DOT_HOVER
         elif port.required:
             fill, border = base, base.darker(140)
@@ -686,6 +723,32 @@ class NodeItem(QGraphicsObject):
         rename_action = menu.addAction(t("Rename..."))
         rename_action.triggered.connect(
             lambda: self.label_edit_requested.emit(self)
+        )
+        if getattr(self, "supports_file_queue", False):
+            queue_action = menu.addAction(t("Manage queue..."))
+            queue_action.triggered.connect(
+                lambda: self.queue_manage_requested.emit(self)
+            )
+        menu.addSeparator()
+        duplicate = menu.addAction(t("Duplicate"))
+        duplicate.setShortcut(QKeySequence("Ctrl+D"))
+        duplicate.triggered.connect(
+            lambda: self.fleet_action_requested.emit(self, "duplicate")
+        )
+        duplicate_rewire = menu.addAction(t("Duplicate and reconnect"))
+        duplicate_rewire.triggered.connect(
+            lambda: self.fleet_action_requested.emit(self, "duplicate_rewire")
+        )
+        if getattr(self, "supports_file_queue", False):
+            assign = menu.addAction(t("Assign files..."))
+            assign.triggered.connect(
+                lambda: self.fleet_action_requested.emit(self, "assign_files")
+            )
+        menu.addSeparator()
+        delete = menu.addAction(t("Delete"))
+        delete.setShortcut(QKeySequence.StandardKey.Delete)
+        delete.triggered.connect(
+            lambda: self.fleet_action_requested.emit(self, "delete")
         )
         menu.exec(event.screenPos())
         event.accept()

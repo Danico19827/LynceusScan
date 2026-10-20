@@ -20,6 +20,12 @@ PROCESSING_SPECS = {
     "point_cloud_dir": "classified",
     "provides": {"classified": True},
     "output_globs": ("classified/**/*.laz",),
+    # Full-cloud decode retained as x/y/z plus mask and cloth grids.
+    "tile_weight_factor": 1.5,
+    # Point-grid working set (POINT_GRID_BYTES_PER_CELL): the cloth grid
+    # scales with tile AREA at csf_resolution, not with points.
+    "grid_bytes_per_cell": 96,
+    "grid_resolution_keys": ("csf_resolution",),
     "config_schema": {
         "csf_resolution": {
             "type": "float",

@@ -408,5 +408,381 @@ class DropSkippedTasksTests(unittest.TestCase):
         )
 
 
+class ExportLayoutTests(unittest.TestCase):
+    """Finals-only export layout: nested legacy vs flat (no cache)."""
+
+    def _controller(self, modules: dict) -> PipelineController:
+        ctrl = PipelineController()
+        ctrl._modules = dict(modules)
+        ctrl._run_configs = {}
+        return ctrl
+
+    def _names(self, order, modules) -> dict:
+        return self._controller(modules)._export_filenames(order, {})
+
+    def test_single_export_keeps_clean_name(self) -> None:
+        names = self._names(["e1"], {"e1": EXPORT})
+        self.assertEqual(
+            names, {"e1": "point_cloud_consolidated.laz"})
+
+    def test_two_exports_suffix_deterministically(self) -> None:
+        modules = {"e1": EXPORT, "e2": EXPORT}
+        first = self._names(["e2", "e1"], modules)
+        self.assertEqual(first, {
+            "e2": "point_cloud_consolidated.laz",
+            "e1": "point_cloud_consolidated_2.laz",
+        })
+        again = self._names(["e2", "e1"], modules)
+        self.assertEqual(again, first)
+        # Non-export instances never claim names.
+        self.assertEqual(
+            self._names(["e1", "g1"], {"e1": EXPORT, "g1": GRID}), {
+                "e1": "point_cloud_consolidated.laz"})
+
+    def test_sweep_keeps_export_nested_and_flat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = Path(tmp) / "20260101_000000"
+            arts = sess / "artifacts"
+            nested = arts / "point_cloud_exports" / "e9"
+            nested.mkdir(parents=True)
+            (nested / "point_cloud_consolidated.laz").write_bytes(b"laz")
+            (arts / "point_cloud_consolidated.laz").write_bytes(b"laz")
+            (arts / "clean_flags").mkdir(parents=True)
+            (arts / "clean_flags" / "t0.laz").write_bytes(b"laz")
+            prov = {"nodes": {
+                "e9": {
+                    "module": EXPORT,
+                    "fp": "w",
+                    "files": [
+                        "point_cloud_exports/e9/point_cloud_consolidated.laz",
+                        "point_cloud_consolidated.laz",
+                    ],
+                },
+            }}
+            (sess / "provenance.json").write_text(json.dumps(prov))
+            removed = self._controller({"e9": EXPORT})._sweep_session(sess)
+            self.assertEqual(removed, 1)
+            self.assertTrue(
+                (nested / "point_cloud_consolidated.laz").is_file())
+            self.assertTrue(
+                (arts / "point_cloud_consolidated.laz").is_file())
+            self.assertFalse((arts / "clean_flags").exists())
+
+    def test_flat_export_reuses_by_glob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prev = root / "prev"
+            arts = prev / "artifacts"
+            arts.mkdir(parents=True)
+            (arts / "point_cloud_consolidated.laz").write_bytes(b"laz")
+            entry = {
+                "module": EXPORT,
+                "fp": "w",
+                "files": ["point_cloud_consolidated.laz"],
+                "output": {"file": str(
+                    arts / "point_cloud_consolidated.laz")},
+            }
+            ctrl = self._controller({"e9": EXPORT})
+            found, _ = ctrl._find_reusable([(prev, entry)], set(), EXPORT, "w")
+            self.assertEqual(found, prev)
+            fresh = root / "fresh" / "artifacts"
+            fresh.mkdir(parents=True)
+            done = ctrl._materialize_bundle(prev, fresh, entry)
+            self.assertEqual(done, ["point_cloud_consolidated.laz"])
+            self.assertTrue(
+                (fresh / "point_cloud_consolidated.laz").is_file())
+
+    @staticmethod
+    def _write_laz(path: Path, x0: float, y0: float, count: int) -> None:
+        import laspy
+        import numpy as np
+
+        header = laspy.LasHeader(point_format=0, version="1.2")
+        header.scales = np.array([0.01, 0.01, 0.01])
+        header.offsets = np.zeros(3)
+        record = laspy.ScaleAwarePointRecord.zeros(
+            count,
+            point_format=header.point_format,
+            scales=header.scales,
+            offsets=header.offsets,
+        )
+        record.x = np.full(count, x0 + 50.0)
+        record.y = np.full(count, y0 + 50.0)
+        record.z = np.zeros(count)
+        with laspy.open(str(path), mode="w", header=header) as writer:
+            writer.write_points(record)
+
+    def _tile(self, arts: Path, tid: str, x0: float, count: int) -> dict:
+        path = arts / f"{tid}.laz"
+        self._write_laz(path, x0, 0.0, count)
+        return {
+            "tile_id": tid,
+            "file": str(path),
+            "core_x_min": x0,
+            "core_y_min": 0.0,
+            "core_x_max": x0 + 100.0,
+            "core_y_max": 100.0,
+        }
+
+    def test_barrier_writes_flat_when_named(self) -> None:
+        from lynceus.nodes.lidar.output.export_point_cloud import (
+            barrier_export_point_cloud,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            arts = Path(tmp) / "artifacts"
+            arts.mkdir(parents=True)
+            tiles = [
+                self._tile(arts, "t0", 0.0, 50),
+                self._tile(arts, "t1", 100.0, 60),
+            ]
+            ctx = {
+                "session_dir": str(arts),
+                "node_iid": "e9",
+                "export_filenames": {"e9": "point_cloud_consolidated.laz"},
+                "_point_cloud_sources": [
+                    {"point_cloud_dir": "", "tiles": tiles}],
+                "crop_buffer": True,
+                "intermediate_ext": "laz",
+                "stage_name": "",
+            }
+            payload = barrier_export_point_cloud(ctx)
+            flat = arts / "point_cloud_consolidated.laz"
+            self.assertTrue(flat.is_file())
+            self.assertEqual(payload["file"], str(flat))
+            self.assertEqual(payload["count"], 110)
+            self.assertFalse((arts / "point_cloud_exports").exists())
+
+    def test_barrier_keeps_nested_without_map(self) -> None:
+        from lynceus.nodes.lidar.output.export_point_cloud import (
+            barrier_export_point_cloud,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            arts = Path(tmp) / "artifacts"
+            arts.mkdir(parents=True)
+            tiles = [self._tile(arts, "t0", 0.0, 50)]
+            ctx = {
+                "session_dir": str(arts),
+                "node_iid": "e9",
+                "_point_cloud_sources": [
+                    {"point_cloud_dir": "", "tiles": tiles}],
+                "crop_buffer": True,
+                "intermediate_ext": "laz",
+                "stage_name": "",
+            }
+            payload = barrier_export_point_cloud(ctx)
+            nested = (arts / "point_cloud_exports" / "e9"
+                      / "point_cloud_consolidated.laz")
+            self.assertTrue(nested.is_file())
+            self.assertEqual(payload["file"], str(nested))
+
+
+class FailedProvenanceTests(unittest.TestCase):
+    """Failed/cancelled batches still record provenance (sweep needs it)."""
+
+    def test_provenance_written_without_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = Path(tmp) / "20260101_000000"
+            arts = sess / "artifacts"
+            arts.mkdir(parents=True)
+            (arts / "dtm_mosaic.tif").write_bytes(b"mosaic")
+            ctrl = PipelineController()
+            ctrl._modules = {"a": DTM}
+            ctrl._run_configs = {}
+            nodes = ctrl._save_provenance(
+                sess, {}, Path(tmp), {"a": "fp-a"}, ["a"], [],
+                {}, {},
+            )
+            prov = json.loads((sess / "provenance.json").read_text())
+            self.assertIn("a", prov["nodes"])
+            self.assertEqual(
+                nodes["a"]["files"], ["dtm_mosaic.tif"])
+            self.assertEqual(prov["nodes"]["a"]["fp"], "fp-a")
+
+
+class MergeSegmentsFlagTests(unittest.TestCase):
+    """Independent segments: flag travels in fingerprints; prune rewires."""
+
+    LOAD = "lynceus.nodes.lidar.source.load_las_laz"
+    DTM = "lynceus.nodes.lidar.terrain.generate_dtm"
+
+    def _ctrl(self) -> PipelineController:
+        ctrl = PipelineController()
+        ctrl._modules = {"l1": self.LOAD, "c1": self.DTM}
+        return ctrl
+
+    def test_flag_travels_in_fp(self) -> None:
+        ctrl = self._ctrl()
+        base = {"file_path": "/d/a.laz", "merge_segments": True}
+        indep = {"file_path": "/d/a.laz", "merge_segments": False}
+        plain = ctrl._node_fingerprints(["l1"], [], {"l1": base}, {})
+        split = ctrl._node_fingerprints(["l1"], [], {"l1": indep}, {})
+        self.assertNotEqual(plain["l1"], split["l1"])
+
+    def test_downstream_inherits_flag_change(self) -> None:
+        ctrl = self._ctrl()
+        iids = ["l1", "c1"]
+        edges = [("l1", "c1", "point_cloud", "point_cloud")]
+        plain = ctrl._node_fingerprints(
+            iids, edges,
+            {"l1": {"file_path": "/d/a.laz", "merge_segments": True}}, {},
+        )
+        split = ctrl._node_fingerprints(
+            iids, edges,
+            {"l1": {"file_path": "/d/a.laz", "merge_segments": False}}, {},
+        )
+        self.assertNotEqual(plain["c1"], split["c1"])
+
+    def test_resolve_defaults_to_merge(self) -> None:
+        ctrl = self._ctrl()
+        self.assertTrue(ctrl._resolve_merge_segments({}, ["l1"]))
+        self.assertTrue(ctrl._resolve_merge_segments(None, []))
+        self.assertFalse(ctrl._resolve_merge_segments(
+            {"l1": {"merge_segments": False}}, ["l1"]))
+        self.assertTrue(ctrl._resolve_merge_segments(
+            {"l1": {"merge_segments": True}}, ["l1"]))
+
+
+class FailureRecordTests(unittest.TestCase):
+    """Failure reasons reach disk (provenance/session_meta/results/state)."""
+
+    def _ctrl(self, tmp: Path) -> PipelineController:
+        from types import SimpleNamespace
+
+        from lynceus.processing.controller import PipelineCallbacks
+
+        ctrl = PipelineController()
+        ctrl._modules = {"b": GRID, "c": DTM}
+        ctrl._node_failed = set()
+        ctrl._node_failures = {}
+        ctrl._node_task_done = {}
+        ctrl._node_task_total = {}
+        ctrl._reused_barriers = set()
+        ctrl._stage_done = {}
+        ctrl._stage_total = {}
+        ctrl._session_dir = tmp
+        cb = PipelineCallbacks()
+        prog = ctrl._make_dag_progress(cb)
+        prog(0, 2, SimpleNamespace(iid="b", kind="barrier",
+                                   task_id="b|merge"),
+             False, RuntimeError("boom\nsecond line"))
+        prog(1, 2, SimpleNamespace(iid="c", kind="barrier",
+                                   task_id="c|merge"),
+             False, None)
+        return ctrl
+
+    def _tmp(self) -> Path:
+        import shutil
+
+        tmp = Path(tempfile.mkdtemp(prefix="failrec_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return tmp
+
+    def test_progress_records_first_line_and_cascade(self) -> None:
+        ctrl = self._ctrl(self._tmp())
+        self.assertEqual(ctrl._node_failures["b"],
+                         "boom | caused by: second line")
+        self.assertEqual(
+            ctrl._node_failures["c"], "blocked by failed dependency")
+
+    def test_meta_and_state_carry_reasons(self) -> None:
+        tmp = self._tmp()
+        ctrl = self._ctrl(tmp)
+        ctrl._session_state = {}
+        ctrl._update_session_meta("failed")
+        meta = json.loads((tmp / "session_meta.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(meta["failure_reasons"]["b"],
+                         "boom | caused by: second line")
+        ctrl._session_state["failed_nodes"] = sorted(ctrl._node_failed)
+        ctrl._session_state["failure_reasons"] = dict(ctrl._node_failures)
+        ctrl._save_session_state()
+        state = json.loads((tmp / "session_state.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(state["failure_reasons"]["c"],
+                         "blocked by failed dependency")
+
+    def test_results_appends_per_iid_errors(self) -> None:
+        tmp = self._tmp()
+        ctrl = self._ctrl(tmp)
+        tiles = [{"tile_id": "t0", "node": GRID, "output": "x.gpkg"}]
+        ctrl._write_results(tiles)
+        ledger = json.loads((tmp / "results.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(len(ledger), 3)
+        errors = {e["iid"]: e for e in ledger if "error" in e}
+        self.assertEqual(errors["b"]["error"],
+                         "boom | caused by: second line")
+        self.assertEqual(errors["b"]["node"], GRID)
+        self.assertTrue(all("tile_id" not in e for e in ledger
+                            if "error" in e))
+
+    def test_provenance_attaches_error(self) -> None:
+        tmp = self._tmp()
+        ctrl = self._ctrl(tmp)
+        sess = tmp / "sess"
+        (sess / "artifacts").mkdir(parents=True)
+        nodes = ctrl._save_provenance(
+            sess, {"": "fp"}, tmp, {"b": "fp-b", "c": "fp-c"},
+            ["b", "c"], [], {}, {"b": {"strategy": "grid"},
+                                 "c": {"strategy": "dtm"}})
+        self.assertEqual(nodes["b"]["error"],
+                         "boom | caused by: second line")
+        self.assertEqual(nodes["c"]["error"], "blocked by failed dependency")
+        on_disk = json.loads((sess / "provenance.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(on_disk["nodes"]["b"]["error"],
+                         "boom | caused by: second line")
+
+    def test_run_abort_persists_without_batch_epilogue(self) -> None:
+        tmp = self._tmp()
+        ctrl = self._ctrl(tmp)
+        ctrl._node_task_total = {"b": 1, "c": 1}
+        ctrl._node_failed = set()
+        ctrl._node_failures = {}
+        reason = ctrl._record_run_abort(RuntimeError("kaboom"))
+        self.assertEqual(reason, "kaboom")
+        self.assertEqual(
+            ctrl._node_failures["b"], "run aborted: kaboom")
+        state = json.loads((tmp / "session_state.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(state["pipeline_status"], "failed")
+        self.assertEqual(state["failure_reasons"]["c"],
+                         "run aborted: kaboom")
+        meta = json.loads((tmp / "session_meta.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(meta["pipeline_status"], "failed")
+        self.assertIn("b", meta["failure_reasons"])
+        ledger = json.loads((tmp / "results.json").read_text(
+            encoding="utf-8"))
+        self.assertTrue(all("error" in e for e in ledger))
+        self.assertEqual(
+            {e["iid"] for e in ledger}, {"b", "c"})
+
+    def test_run_abort_never_breaks_twice(self) -> None:
+        ctrl = PipelineController()
+        ctrl._node_task_total = {}
+        # No session dir, no state: must still return the reason.
+        self.assertEqual(ctrl._record_run_abort(ValueError("")),
+                         "unknown error")
+
+    def test_chained_reason_keeps_root_cause(self) -> None:
+        from lynceus.processing.controller import _failure_reason
+
+        self.assertEqual(_failure_reason(ValueError("boom")), "boom")
+        self.assertEqual(_failure_reason(ValueError("")), "unknown error")
+        chained = _failure_reason(RuntimeError(
+            "Write failed. See previous exception for details.\n"
+            "Some context\n"
+            "No space left on device (os error 28)"))
+        self.assertIn("Write failed", chained)
+        self.assertIn("No space left on device", chained)
+        single = _failure_reason(RuntimeError("x\ny\nx"))
+        self.assertEqual(single, "x")
+        long = _failure_reason(ValueError("z" * 500))
+        self.assertLessEqual(len(long), 401)
+
+
 if __name__ == "__main__":
     unittest.main()

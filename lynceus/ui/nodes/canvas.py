@@ -4,15 +4,19 @@ import importlib
 import math
 import os
 import re
+import time
+import copy
+import uuid
 from dataclasses import dataclass
 from typing import Callable
 
 from PySide6.QtCore import QEvent, QPointF, QRect, QSettings, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QPainterPath, QPen, QPolygonF, QShortcut
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QPainter, QPainterPath, QPen, QPolygonF, QRadialGradient, QShortcut
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QComboBox,
+    QDialog,
     QFrame,
     QGraphicsItem,
     QGraphicsPathItem,
@@ -21,6 +25,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QTextEdit,
     QToolButton,
@@ -28,9 +33,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from lynceus.processing.controller import PipelineCallbacks, PipelineController
+from lynceus.processing.controller import (
+    PipelineCallbacks,
+    PipelineController,
+    resolve_output_root,
+)
 from lynceus.processing.executor import workers_for_percent
 from lynceus.processing.tiler import memory_budget_for_percent
+from lynceus.graph_clipboard import (
+    decode_subgraph,
+    encode_subgraph,
+    extract_subgraph,
+)
+from lynceus.nodes._variants import strategy_options
 from lynceus.plugins.locale import t
 from lynceus.plugins.registry import manager
 from lynceus.ui.nodes.canvas_toolbar import CanvasToolbar
@@ -53,6 +68,8 @@ from lynceus.ui.settings_keys import (
     MEMORY_PERCENT_KEY,
     OPERATOR_NAME_KEY,
     OPERATOR_ORG_KEY,
+    OUTPUT_ROOT_KEY,
+    PREFLIGHT_QUIET_KEY,
     SETTINGS_APP,
     SETTINGS_ORG,
     SNAP_KEY,
@@ -75,12 +92,17 @@ NOTICE_ROW_MAX_TEXT = 300
 NOTICE_AUTOHIDE_MS = 7000
 NOTICE_MAX_ROWS = 25
 PERSISTENT_NOTICE_KINDS = ("warning", "error")
+#: Longest failure reason shown per node in the end-of-run report (chars);
+#: engine reasons can carry an OOM hint, the full text stays on disk.
+FAILURE_REASON_MAX = 200
 
 # Textual progress markers ("Tiling... 14%", "DTM 3/51 | CHM 2/51"): once a
 # transient row is updated with such a message it stops auto-hiding, so it
 # never flickers during sparse (>autohide gap) heavy phases. It is removed
-# explicitly when the run finishes/cancels.
-_PROGRESS_RE = re.compile(r"%$|\d+/\d+", re.IGNORECASE)
+# explicitly when the run finishes/cancels. The tiling message carries a
+# rate suffix ("Tiling... 14% (2.5 M pts/s)"); the optional tail keeps it
+# pinned.
+_PROGRESS_RE = re.compile(r"%(\s*\(.*\))?$|\d+/\d+", re.IGNORECASE)
 
 WIRE_COLOR = QColor("#8a93a6")
 WIRE_GHOST_COLOR = QColor("#3a465c")
@@ -89,6 +111,13 @@ WIRE_HIT_MARGIN = 12
 
 # Dim the live canvas while edits are staged against an isolated run snapshot.
 PENDING_OPACITY = 0.55
+
+# Undo/redo history (item 9): snapshot-based document history. The stack holds
+# committed states (history[cursor] == the live graph); a mutation replaces the
+# current slot while it falls inside the merge window, so continuous gestures
+# (drags, typing, spin boxes) collapse into a single undo step.
+UNDO_LIMIT = 100
+UNDO_MERGE_WINDOW = 0.35
 
 # Canvas dot-grid settings (scene units).
 GRID_MINOR = 20
@@ -143,6 +172,38 @@ NOTICE_KIND_COLORS = {
     "success": "#6ec87a",
     "error": "#d46a6a",
 }
+"""Kind colors, mirrored 1:1 by the noticeRow QSS rules below (single
+source of truth for tests; the stylesheet owns the pixels)."""
+
+
+def failure_report_text(
+    failed: int,
+    failed_nodes: dict | None = None,
+    names: dict | None = None,
+    peak_mb=None,
+    session_dir: str = "",
+) -> str:
+    """Durable end-of-run failure report (pure; item 44).
+
+    Status-bar rows are ephemeral and per-node messages can be dismissed or
+    pruned, so the closing summary is the record that survives: which nodes
+    failed, why, and where the session lives. ``names`` maps iid to a
+    display label; unknown ids fall back to the iid.
+    """
+    lines = [t("Run finished with {n} failed task(s)").format(n=failed)]
+    for iid in sorted(failed_nodes or {}):
+        reason = " ".join(str((failed_nodes or {})[iid] or "").split())
+        if len(reason) > FAILURE_REASON_MAX:
+            reason = reason[: FAILURE_REASON_MAX - 1].rstrip() + "…"
+        label = str((names or {}).get(iid) or iid)
+        lines.append(f"• {label}: {reason}" if reason else f"• {label}")
+    if peak_mb:
+        lines.append(
+            t("peak RAM {peak} MB").format(peak=round(float(peak_mb), 1))
+        )
+    if session_dir:
+        lines.append(t("Session folder: {path}").format(path=session_dir))
+    return "\n".join(lines)
 
 
 class _NoticeRow(QFrame):
@@ -153,21 +214,19 @@ class _NoticeRow(QFrame):
     def __init__(self, text: str, kind: str, autohide: bool):
         super().__init__()
         self.setObjectName("noticeRow")
+        # Kind-driven QSS (no inline stylesheets): themes keep working.
+        self.setProperty("noticeKind", kind)
         self._text = text
-        color = NOTICE_KIND_COLORS.get(kind, "#c9d1e3")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 6, 5, 6)
         layout.setSpacing(8)
         dot = QLabel("")
+        dot.setObjectName("noticeDot")
         dot.setFixedSize(8, 8)
-        dot.setStyleSheet(
-            f"background-color: {color}; border-radius: 4px; padding: 0px;"
-        )
         self._body = QLabel(t(text))
         self._body.setObjectName("noticeText")
         self._body.setWordWrap(True)
         self._body.setMaximumWidth(NOTICE_ROW_MAX_TEXT)
-        self._body.setStyleSheet(f"color: {color};")
         dismiss = QToolButton()
         dismiss.setObjectName("noticeDismiss")
         dismiss.setText("×")
@@ -301,6 +360,11 @@ class _NoticeTray(QFrame):
         self._transient_row = None
         self._refit()
 
+    def discard(self, text: str) -> None:
+        """Remove persistent rows matching text (run-scoped notices)."""
+        for row in [r for r in self._rows if r.text() == text]:
+            self._remove_row(row)
+
     def remove_transient(self) -> None:
         """Drop the live progress chip, keeping persistent warnings/errors."""
         if self._transient_row is not None:
@@ -368,6 +432,32 @@ def _setting_bool(key: str, default: bool) -> bool:
     return str(value).strip().lower() not in ("", "0", "false", "no", "off")
 
 
+def _config_int(configs: dict | None, iid: str, key: str) -> int:
+    """Integer config value, junk-tolerant (never breaks run start)."""
+    try:
+        return int((configs.get(iid) or {}).get(key) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _is_loader_caps(caps: dict) -> bool:
+    """Capabilities predicate matching tiling source nodes."""
+    try:
+        return bool((caps or {}).get("triggers_tiling"))
+    except AttributeError:
+        return False
+
+
+def _total_ram_bytes() -> float | None:
+    """Physical RAM for budget advice; None when unreadable."""
+    try:
+        import psutil
+
+        return float(psutil.virtual_memory().total)
+    except Exception:
+        return None
+
+
 def _run_preferences() -> dict:
     """Performance preferences for the next run (Preferences dialog).
 
@@ -408,18 +498,25 @@ class NodeCanvasView(QGraphicsView):
     message_requested = Signal(str, str)  # text, kind ("info"|"action"|"success"|"error")
     graph_changed = Signal()
     node_selected = Signal(object)  # NodeItem | None.
+    nodes_selected = Signal(object)  # list[NodeItem]: multi-selection panel.
     node_status_changed = Signal(object, str)
     load_tile_count = Signal(int)
     outputs_updated = Signal(object)  # list[OutputProduct].
     pipeline_started = Signal()
     pipeline_finished = Signal(dict, list, int, list, dict)  # outputs, tile_results, failed, tiles, metrics
     pipeline_cancelled = Signal()
+    pipeline_closed = Signal()  # pool torn down: next queued run may start
     pipeline_progress = Signal(int, int)  # done, total
     inspector_refresh_requested = Signal()  # Refresh the selected node.
     segment_started = Signal(int, int, int)  # k, n, point count of the batch.
     segment_outputs_changed = Signal(int, int, object)  # k, n, batch outputs dict.
     consolidated_outputs_ready = Signal(object)  # final/merged outputs dict.
+    barrier_outputs_changed = Signal(str, object)  # iid, barrier payload.
+    barrier_started = Signal(str)  # iid of the dispatched barrier.
     node_preview_requested = Signal(str, str)  # path, node EN name (bridge preview).
+    open_preferences_requested = Signal(str)  # preferences section name (EN).
+    history_changed = Signal(bool, bool)  # can_undo, can_redo (item 9).
+    history_applied = Signal()  # after undo/redo restored a document.
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -432,9 +529,12 @@ class NodeCanvasView(QGraphicsView):
         font_changed.connect(self._on_font_changed)
         # Native scene changes (Ctrl+click multi-select, rubber band,
         # background-click deselect) bypass the item signals: funnel every
-        # change through the single-or-None inspector rule here.
+        # change through the inspector rule here (single -> item, several ->
+        # multi panel, zero -> placeholder).
         self._syncing_selection = False
         self._selected_item = None
+        self._inspector_multi = None
+        self._inspector_busy = False
         self._scene.selectionChanged.connect(self._sync_inspector_to_scene)
         self.setAcceptDrops(True)
         # Drag events are delivered to the viewport widget: without this,
@@ -442,6 +542,10 @@ class NodeCanvasView(QGraphicsView):
         # library drop (harmless, but noisy).
         self.viewport().setAcceptDrops(True)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Left-drag on empty space draws a selection band (Ctrl adds to the
+        # current selection); the middle button keeps panning (handled in
+        # mousePressEvent before the base class sees the event).
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self._node_items: list[NodeItem] = []
@@ -457,6 +561,14 @@ class NodeCanvasView(QGraphicsView):
         # Restoring a graph must not auto-select an item before its config is
         # available to the Inspector.
         self._restoring = False
+        # Undo/redo document history (item 9). Empty until seeded by
+        # clear_history(); _undo_active suppresses recording during restores.
+        self._history: list[dict] = []
+        self._cursor = 0
+        self._undo_active = False
+        self._merge_since: float | None = None
+        self._last_kind: str | None = None  # kind of the recorded mutation
+        self._op_kind: str | None = None  # overrides kind during a batch op
         # Session root for the loaded project; None uses the loose output root.
         self.session_root = None
 
@@ -470,6 +582,25 @@ class NodeCanvasView(QGraphicsView):
         # snapshot and are applied or discarded when the run finishes.
         self._run_active = False
         self._graph_snapshot: dict | None = None
+        # File-queue driver: None, or {"iid", "files", "index", "results",
+        # "order", "nodes", "edges", "configs", "source_paths", "prefs",
+        # "stop", "got_finished"}. One engine run per file, chained from
+        # the post-cleanup closed signal (never from finished: the old
+        # pool is still alive until cleanup joins it).
+        self._file_queue: dict | None = None
+        self._queue_flat: list = []
+        # Live gallery: per-barrier products published at completion
+        # ({iid: [OutputProduct]}), plus whether a segment batch owns the
+        # phase display (batches publish authoritatively at batch end).
+        self._live_products: dict[str, list] = {}
+        self._batch_active = False
+        self._had_segments = False
+        self._segment_products: dict = {}
+        self._flat_products: list = []
+        # Provisional-styling FYI: shown once per run at the first
+        # pre-finish publish, removed when the run ends.
+        self._live_notice_shown = False
+        self._live_notice_text = ""
 
         # EULA gates: the UI gate may show dialogs; the controller gate runs in
         # the worker and must never touch Qt.
@@ -479,14 +610,20 @@ class NodeCanvasView(QGraphicsView):
         self._toolbar.btn_snap.setChecked(self._snap_enabled)
         self._install_zoom_shortcuts()
         self._install_delete_shortcuts()
+        self._install_clipboard_shortcuts()
+        self._install_history_shortcuts()
+        self.clear_history()
 
         self.node_status_changed.connect(self._on_node_status)
         self.load_tile_count.connect(self._on_load_tile_count)
         self.pipeline_finished.connect(self._on_pipeline_finished)
         self.pipeline_cancelled.connect(self._on_pipeline_cancelled)
+        self.pipeline_closed.connect(self._on_pipeline_closed)
         self.segment_started.connect(self._on_segment_started)
         self.segment_outputs_changed.connect(self._on_segment_outputs)
         self.consolidated_outputs_ready.connect(self._on_consolidated_outputs)
+        self.barrier_outputs_changed.connect(self._on_barrier_outputs)
+        self.barrier_started.connect(self._on_barrier_started)
         self.graph_changed.connect(self._update_pending_chip)
 
         self._install_status_chip()
@@ -546,6 +683,7 @@ class NodeCanvasView(QGraphicsView):
         self._run_active = False
         self._graph_snapshot = None
         self._set_run_pending(False)
+        self._emit_history_state()
 
     def _pending_diff(self) -> dict:
         """Compare the live canvas with the run-start snapshot.
@@ -601,6 +739,7 @@ class NodeCanvasView(QGraphicsView):
         """
         self._pending_chip = QLabel("", self.viewport())
         self._pending_chip.setObjectName("canvasStatusChip")
+        self._pending_chip.setProperty("origText_en", "Changes pending")
         self._pending_chip.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents
         )
@@ -651,6 +790,44 @@ class NodeCanvasView(QGraphicsView):
         if tray is None or not text:
             return
         tray.add_notice(text, kind)
+
+    def post_notice(self, text: str, kind: str = "info") -> None:
+        """Public entry point for a persistent canvas notice (item 45, etc.).
+
+        Persistent kinds (warning/error) stay until dismissed; callers must
+        run this on the GUI thread.
+        """
+        self._feed_notice(text, kind)
+
+    def _maybe_show_live_notice(self) -> None:
+        """One FYI per run: pre-finish products render with generic styles.
+
+        Anything visible before the run ends lacks its final `.qml` sidecar
+        (generated post-DAG), so the viewer falls back to generic styling
+        until the closing publish refreshes it. Shown once, removed when
+        the run ends (finish/cancel/queue close).
+
+        English by policy: engine/run notices stay in English (operators
+        share them verbatim); only the surrounding UI chrome is translated.
+        """
+        if self._live_notice_shown:
+            return
+        self._live_notice_shown = True
+        tray = getattr(self, "_notice_tray", None)
+        if tray is None:
+            return
+        self._live_notice_text = (
+            "Provisional styling: product previews use generic styles "
+            "until the run finishes."
+        )
+        tray.add_notice(self._live_notice_text, "warning")
+
+    def _hide_live_notice(self) -> None:
+        text = getattr(self, "_live_notice_text", "")
+        tray = getattr(self, "_notice_tray", None)
+        if tray is not None and text:
+            tray.discard(text)
+        self._live_notice_text = ""
 
     def _position_notice_tray(self) -> None:
         tray = getattr(self, "_notice_tray", None)
@@ -737,6 +914,9 @@ class NodeCanvasView(QGraphicsView):
 
         if box.clickedButton() is apply_btn:
             self._clear_run_pending()
+            # The staged edits are now the live graph: record them so a
+            # single undo reverts to the pre-run state.
+            self._record_current_state("run")
         else:
             self._discard_pending_changes()
 
@@ -747,6 +927,8 @@ class NodeCanvasView(QGraphicsView):
         self._graph_snapshot = None
         self.restore_graph(snapshot)
         self._set_run_pending(False)
+        self._merge_since = None
+        self._emit_history_state()
 
     # ------------------------------------------------------------------
     # Live state (GUI thread)
@@ -761,8 +943,14 @@ class NodeCanvasView(QGraphicsView):
                 item.set_tile_count(count)
 
     def _flatten_products(self, outputs: dict, segment: str | None = None,
-                          segment_index: int | None = None) -> list:
-        """Flatten run outputs into gallery products (Qt-free helper)."""
+                           segment_index: int | None = None,
+                           file_overrides: dict | None = None) -> list:
+        """Flatten run outputs into gallery products (Qt-free helper).
+
+        ``file_overrides`` maps instance IDs to the file a queue iteration
+        actually ran with: lineage basenames and source previews follow the
+        iteration file, not the item's stored head.
+        """
         failed_nodes = set(
             self._pipeline.session_state.get("failed_nodes", [])
         )
@@ -776,16 +964,20 @@ class NodeCanvasView(QGraphicsView):
             for iid, item in self._item_by_iid.items()
             if item.label()
         }
+        overrides = dict(file_overrides or {})
         source_files: dict[str, str] = {}
         source_paths: dict[str, str] = {}
         for iid, item in self._item_by_iid.items():
-            file_path = getattr(item, "file_path", None)
-            if not callable(file_path):
-                continue
-            try:
-                path = file_path()
-            except Exception:
-                continue
+            if iid in overrides:
+                path = overrides[iid]
+            else:
+                file_path = getattr(item, "file_path", None)
+                if not callable(file_path):
+                    continue
+                try:
+                    path = file_path()
+                except Exception:
+                    continue
             if path:
                 source_files[iid] = os.path.basename(path)
                 source_paths[iid] = path
@@ -806,6 +998,7 @@ class NodeCanvasView(QGraphicsView):
     def _on_segment_started(self, k: int, n: int, points: int) -> None:
         """Show the segment progress chip while batches are queued/processing."""
         self._had_segments = True
+        self._batch_active = True
         chip = getattr(self, "_segment_chip", None)
         if chip is None:
             return
@@ -820,7 +1013,21 @@ class NodeCanvasView(QGraphicsView):
     @Slot(int, int, object)
     def _on_segment_outputs(self, k: int, n: int, outputs: dict) -> None:
         """Publish a finished segment's products to the gallery immediately."""
+        self._batch_active = False
         if not outputs:
+            return
+        self._maybe_show_live_notice()
+        if self._file_queue is not None:
+            # Queue iteration: tag with the file block and accumulate; the
+            # gallery refreshes from the accumulated list at each finish.
+            label = self._queue_file_label()
+            self._queue_iter = getattr(self, "_queue_iter", [])
+            self._queue_iter.extend(self._flatten_products(
+                outputs,
+                segment=f"{label} · Segment {k}/{n}",
+                segment_index=k,
+                file_overrides=self._queue_override(),
+            ))
             return
         self._segment_products[k] = self._flatten_products(
             outputs,
@@ -834,14 +1041,81 @@ class NodeCanvasView(QGraphicsView):
         """Store the final/merged products (consolidated, no segment tag)."""
         if not outputs:
             return
+        self._maybe_show_live_notice()
+        # Live entries republished here authoritatively would duplicate.
+        for iid in outputs:
+            self._live_products.pop(iid, None)
+        if self._file_queue is not None:
+            self._queue_iter = getattr(self, "_queue_iter", [])
+            self._queue_iter.extend(self._flatten_products(
+                outputs,
+                segment=self._queue_file_label(),
+                segment_index=self._file_queue["index"],
+                file_overrides=self._queue_override(),
+            ))
+            return
         self._flat_products = self._flatten_products(outputs)
         self._emit_gallery()
+
+    @Slot(str, object)
+    def _on_barrier_outputs(self, iid: str, payload: dict) -> None:
+        """Publish one finished barrier to the gallery immediately.
+
+        Products appear under their node as merges complete (e.g. the CHM
+        is previewable while downstream nodes still run) instead of waiting
+        for the whole run. Segment batches are skipped: the batch end
+        publishes authoritatively and a live entry would duplicate it.
+        In file-queue mode the iteration accumulates silently (emitting now
+        would hide the previous iterations) and flushes at its finish.
+        """
+        if not isinstance(payload, dict) or not payload:
+            return
+        if self._batch_active:
+            return
+        if self._file_queue is not None:
+            flattened = self._flatten_products(
+                {iid: payload},
+                segment=self._queue_file_label(),
+                segment_index=self._file_queue["index"],
+                file_overrides=self._queue_override(),
+            )
+        else:
+            flattened = self._flatten_products({iid: payload})
+        if not flattened:
+            return
+        self._maybe_show_live_notice()
+        self._live_products[iid] = flattened
+        if self._file_queue is None:
+            self._emit_gallery()
+
+    @Slot(str)
+    def _on_barrier_started(self, iid: str) -> None:
+        """Sticky phase chip while a merge/barrier runs (big files).
+
+        Tile counters freeze during a long single merge; the chip names the
+        running barrier until the next phase or the finish hides it.
+        """
+        if self._batch_active:
+            return  # the segment chip owns the phase display
+        chip = getattr(self, "_segment_chip", None)
+        if chip is None:
+            return
+        item = self._item_by_iid.get(iid)
+        try:
+            label = item.node_name_en() if item is not None else iid
+        except Exception:
+            label = iid
+        chip.setText(f"Merging {label}...")
+        chip.setVisible(True)
+        self._position_status_chip()
 
     def _emit_gallery(self) -> None:
         """Rebuild the gallery from accumulated segment + consolidated products."""
         products = []
         for k in sorted(self._segment_products):
             products.extend(self._segment_products[k])
+        for _iid, live in self._live_products.items():
+            products.extend(live)
         products.extend(self._flat_products)
         self.outputs_updated.emit(products)
 
@@ -867,6 +1141,12 @@ class NodeCanvasView(QGraphicsView):
         consolidated products via ``consolidated_outputs_ready``; the flat run
         outputs are only re-emitted for non-segmented runs.
         """
+        if self._file_queue is not None:
+            # Queue iteration: record, stash its gallery block and wait for
+            # the post-cleanup closed signal to advance (never here: the
+            # pool is still alive until cleanup joins it).
+            self._record_queue_result(outputs, failed, tiles, metrics)
+            return
         self._sync_toolbar_state("idle")
         chip = getattr(self, "_segment_chip", None)
         if chip is not None:
@@ -879,13 +1159,43 @@ class NodeCanvasView(QGraphicsView):
         self._clear_node_statuses(only_processing=True)
         if not self._had_segments:
             self._flat_products = self._flatten_products(outputs)
+            self._live_products = {}
             self._emit_gallery()
+        self._hide_live_notice()
 
         # Staging: apply/discard the changes made during the run.
         self._ask_apply_pending()
 
+        # Persistent failure summary (item 44): errors in the tray survive
+        # until dismissed, unlike the ephemeral status-bar message.
+        if failed > 0 and metrics:
+            self._feed_notice(self._failure_summary_text(failed, metrics), "error")
+
+    def _failure_summary_text(self, failed: int, metrics: dict) -> str:
+        """Persistent end-of-run report: failed nodes, reasons, session."""
+        failed_nodes = metrics.get("failed_nodes")
+        names: dict = {}
+        for iid in failed_nodes or {}:
+            item = self._item_by_iid.get(iid)
+            try:
+                names[iid] = item.display_name() if item is not None else iid
+            except Exception:
+                names[iid] = iid
+        return failure_report_text(
+            failed,
+            failed_nodes,
+            names,
+            metrics.get("peak_memory_mb"),
+            metrics.get("session_dir") or "",
+        )
+
     def _on_pipeline_cancelled(self) -> None:
         """Reset the toolbar and discard staging after cancellation."""
+        if self._file_queue is not None:
+            # A queue iteration was cancelled: stop the whole queue; the
+            # post-cleanup closed signal finishes with a partial summary.
+            self._file_queue["stop"] = True
+            return
         self._sync_toolbar_state("idle")
         # A cancelled run leaves nodes in "processing" (the worker never emits
         # a final status): restore every outline to the base color and stop
@@ -897,7 +1207,281 @@ class NodeCanvasView(QGraphicsView):
         tray = getattr(self, "_notice_tray", None)
         if tray is not None:
             tray.remove_transient()
+        self._hide_live_notice()
         self._clear_run_pending()
+
+    # ------------------------------------------------------------------
+    # File-queue driver (GUI thread)
+    # ------------------------------------------------------------------
+
+    def _manage_file_queue(self, item) -> None:
+        """Open the queue manager for one file-backed node item."""
+        from lynceus.ui.nodes.widgets.file_queue_dialog import (
+            FileQueueDialog,
+        )
+
+        dialog = FileQueueDialog(
+            self, item.file_queue(), item._queue_filters())
+        dialog.exec()
+        item.set_file_queue(dialog.queue())
+
+    def _queue_file_label(self) -> str:
+        """Gallery/chip label of the iteration being published."""
+        queue = self._file_queue or {}
+        files = queue.get("files", [])
+        index = int(queue.get("index", 0))
+        name = os.path.basename(files[index]) if index < len(files) else "?"
+        total = len(files)
+        return t("File {k} of {n}: {name}").format(
+            k=index + 1, n=total, name=name)
+
+    def _queue_override(self) -> dict:
+        """Per-run file override for the current queue iteration."""
+        queue = self._file_queue or {}
+        files = queue.get("files", [])
+        index = int(queue.get("index", 0))
+        if not queue.get("iid") or index >= len(files):
+            return {}
+        return {queue["iid"]: files[index]}
+
+    def _start_file_queue(self, item, nodes: list, edges: list,
+                          source_paths: dict, configs: dict,
+                          run_prefs: dict) -> None:
+        """Begin a chained queue: one engine run per existing file."""
+        from lynceus.nodes import _file_queue as fq
+
+        existing, missing = fq.partition_existing(item.file_queue())
+        order = list(item.file_queue())
+        results = [
+            {"file": path, "ok": False, "reason": "File not found"}
+            for path in missing
+        ]
+        if not existing:
+            self._emit(fq.summarize_queue(results), "warning")
+            self._sync_toolbar_state("idle")
+            self._clear_run_pending()
+            return
+        if len(existing) > 1:
+            self._warn_queue_merge(item, nodes, edges, configs)
+        self._file_queue = {
+            "iid": item.iid,
+            "files": existing,
+            "index": 0,
+            "results": results,
+            "order": order,
+            "nodes": list(nodes),
+            "edges": list(edges),
+            "configs": copy.deepcopy(configs),
+            "source_paths": dict(source_paths),
+            "prefs": dict(run_prefs),
+            "stop": False,
+            "got_finished": False,
+        }
+        self._queue_flat = []
+        self._launch_queue_iteration()
+
+    def _warn_queue_merge(self, item, nodes: list, edges: list,
+                          configs: dict) -> None:
+        """Heads-up when a chain re-runs a consolidation for every file."""
+        from lynceus.processing.steps import effective_node_caps
+
+        merge_iids = {
+            iid
+            for iid, nid in nodes or []
+            if effective_node_caps(nid, configs.get(iid)).get("consolidator")
+        }
+        if not merge_iids:
+            return
+        children: dict[str, set] = {}
+        for edge in edges or []:
+            if len(edge) < 2:
+                continue
+            children.setdefault(edge[0], set()).add(edge[1])
+        seen: set = set()
+        stack = [item.iid]
+        reachable: set = set()
+        while stack:
+            iid = stack.pop()
+            if iid in seen:
+                continue
+            seen.add(iid)
+            if iid in merge_iids:
+                reachable.add(iid)
+            stack.extend(children.get(iid, ()))
+        if reachable:
+            names = [
+                self._item_by_iid.get(iid).display_name()
+                for iid in sorted(reachable)
+                if self._item_by_iid.get(iid) is not None
+            ]
+            self._emit(
+                t(
+                    "File queue: the merge/consolidate node(s) will re-run "
+                    "for every queued file ({names})"
+                ).format(names=", ".join(names)),
+                "warning",
+            )
+
+    def _launch_queue_iteration(self) -> None:
+        """Start the engine run for the current queue file (GUI thread).
+
+        Runs on frozen run arguments (nodes/edges/configs/source_paths from
+        queue start) plus the per-file override: live edits stay staged and
+        never leak into later iterations. Called from the post-cleanup
+        closed signal, so the previous pool is already joined.
+        """
+        queue = self._file_queue
+        if queue is None:
+            return
+        queue["got_finished"] = False
+        self._queue_iter = []
+        # Fresh per-iteration accumulators (stashed into _queue_flat on
+        # finish); node outlines pulse again from idle.
+        self._had_segments = False
+        self._segment_products = {}
+        self._flat_products = []
+        self._live_products = {}
+        self._batch_active = False
+        scope_iids = {iid for iid, _ in queue["nodes"]}
+        for iid, item in self._item_by_iid.items():
+            if iid in scope_iids:
+                item.set_status(STATUS_IDLE)
+        chip = getattr(self, "_segment_chip", None)
+        if chip is not None:
+            chip.setText(self._queue_file_label())
+            chip.setVisible(True)
+            self._position_status_chip()
+        prefs = queue["prefs"]
+        self._pipeline.set_acceleration_mode(prefs["acceleration_mode"])
+        self._pipeline.set_acceleration_backend(
+            prefs["acceleration_backend"], prefs["acceleration_device"]
+        )
+        self.pipeline_started.emit()
+        self._pipeline.run(
+            queue["nodes"], queue["edges"], queue["source_paths"],
+            self._pipeline_callbacks(), session_root=self.session_root,
+            configs=copy.deepcopy(queue["configs"]),
+            max_workers=prefs["max_workers"],
+            memory_budget_bytes=prefs["memory_budget_bytes"],
+            operator=prefs["operator"],
+            keep_intermediates=prefs["keep_intermediates"],
+            file_overrides=self._queue_override(),
+        )
+
+    def _record_queue_result(self, outputs: dict, failed: int,
+                             tiles: list, metrics: dict) -> None:
+        """Stash one iteration: result row + its gallery block."""
+        queue = self._file_queue
+        if queue is None:
+            return
+        files = queue["files"]
+        index = int(queue["index"])
+        path = files[index] if index < len(files) else "?"
+        blocked = next(
+            (str(key) for key in (metrics or {})
+             if str(key).startswith("blocked_by_")),
+            None,
+        )
+        if blocked is not None:
+            ok, reason = False, f"Blocked ({blocked})"
+        elif failed:
+            names = []
+            failed_map = (
+                metrics.get("failed_nodes")
+                if isinstance(metrics, dict) else None
+            )
+            if isinstance(failed_map, dict) and failed_map:
+                failed_iids = sorted(failed_map)
+            else:
+                try:
+                    failed_iids = self._pipeline.session_state.get(
+                        "failed_nodes", [])
+                except Exception:
+                    failed_iids = []
+            for iid in failed_iids:
+                item = self._item_by_iid.get(iid)
+                try:
+                    names.append(
+                        item.display_name() if item is not None else iid)
+                except Exception:
+                    names.append(iid)
+            detail = ", ".join(names[:3])
+            if len(names) > 3:
+                detail += ", …"
+            reason = f"{failed} failed task(s): {detail}" if detail else (
+                f"{failed} failed task(s)")
+            ok = False
+        else:
+            ok, reason = True, ""
+        queue["results"].append({"file": path, "ok": ok, "reason": reason})
+        queue["got_finished"] = True
+        label = self._queue_file_label()
+        per_file = list(getattr(self, "_queue_iter", []))
+        for _iid, live in self._live_products.items():
+            per_file.extend(live)
+        if not self._had_segments:
+            fresh = {
+                iid: out for iid, out in outputs.items()
+                if iid not in self._live_products
+            }
+            per_file.extend(self._flatten_products(
+                fresh, segment=label, segment_index=index,
+                file_overrides=self._queue_override(),
+            ))
+        else:
+            per_file.extend(self._flat_products)
+        self._queue_flat.extend(per_file)
+        self._queue_iter = []
+        self._live_products = {}
+        if per_file:
+            self._maybe_show_live_notice()
+        self.outputs_updated.emit(list(self._queue_flat))
+        self._clear_node_statuses(only_processing=True)
+
+    def _on_pipeline_closed(self) -> None:
+        """Advance the file queue once the run is fully closed (GUI thread)."""
+        queue = self._file_queue
+        if queue is None:
+            return
+        if not queue["got_finished"]:
+            # No finished signal arrived (pipeline error or cancel): record
+            # the iteration before moving on so the summary stays exact.
+            files = queue["files"]
+            index = int(queue["index"])
+            path = files[index] if index < len(files) else "?"
+            reason = "Cancelled" if queue["stop"] else "Pipeline error"
+            queue["results"].append(
+                {"file": path, "ok": False, "reason": reason})
+        if queue["stop"] or int(queue["index"]) >= len(queue["files"]) - 1:
+            self._finish_queue()
+            return
+        queue["index"] = int(queue["index"]) + 1
+        self._launch_queue_iteration()
+
+    def _finish_queue(self) -> None:
+        """Publish the queue summary and close staging (GUI thread)."""
+        from lynceus.nodes import _file_queue as fq
+
+        queue = self._file_queue
+        self._file_queue = None
+        if queue is None:
+            return
+        order = {path: pos for pos, path in enumerate(queue["order"])}
+        results = sorted(
+            queue["results"],
+            key=lambda row: order.get(row.get("file"), 2 ** 31),
+        )
+        summary = fq.summarize_queue(results, stopped=bool(queue["stop"]))
+        all_ok = all(row.get("ok") for row in results)
+        self._emit(summary, "success" if all_ok else "warning")
+        chip = getattr(self, "_segment_chip", None)
+        if chip is not None:
+            chip.hide()
+        self._hide_live_notice()
+        self._sync_toolbar_state("idle")
+        # Staging: pending edits accumulated across the whole queue resolve
+        # once, like a single run.
+        self._ask_apply_pending()
 
     # ------------------------------------------------------------------
     # Floating toolbar
@@ -978,16 +1562,22 @@ class NodeCanvasView(QGraphicsView):
         """
         if self._focus_is_editing():
             return
-        for connection in list(self._connections):
-            if connection.path_item.isSelected():
-                self._disconnect(connection)
-        self._syncing_selection = True
+        # One undo step for the whole keypress: removed cables and nodes
+        # belong to the same gesture.
+        self._op_kind = "delete"
         try:
-            for item in list(self._node_items):
-                if item.isSelected():
-                    self._remove_node(item)
+            for connection in list(self._connections):
+                if connection.path_item.isSelected():
+                    self._disconnect(connection)
+            self._syncing_selection = True
+            try:
+                for item in list(self._node_items):
+                    if item.isSelected():
+                        self._remove_node(item)
+            finally:
+                self._syncing_selection = False
         finally:
-            self._syncing_selection = False
+            self._op_kind = None
         # The inspector follows the single-selection rule after bulk deletes.
         self._sync_inspector_to_scene()
 
@@ -998,11 +1588,525 @@ class NodeCanvasView(QGraphicsView):
         return isinstance(focus, (QLineEdit, QTextEdit, QComboBox, QAbstractSpinBox))
 
     # ------------------------------------------------------------------
+    # Selection and clipboard (item 8 Fase A)
+    # ------------------------------------------------------------------
+
+    def _install_clipboard_shortcuts(self) -> None:
+        """Window-scoped copy/cut/paste/duplicate/select-all shortcuts.
+
+        Like the delete shortcuts, they work wherever the focus is; the
+        handlers skip while a text field is being edited so typing keeps
+        its normal clipboard meaning there.
+        """
+        for seq, fn in (
+            (QKeySequence.StandardKey.Copy, self._shortcut_copy),
+            (QKeySequence.StandardKey.Cut, self._shortcut_cut),
+            (QKeySequence.StandardKey.Paste, self._shortcut_paste),
+            (QKeySequence("Ctrl+D"), self._shortcut_duplicate),
+            (QKeySequence.StandardKey.SelectAll, self._shortcut_select_all),
+        ):
+            QShortcut(seq, self, activated=fn)
+
+    def _shortcut_copy(self) -> None:
+        if not self._focus_is_editing():
+            self.copy_selection()
+
+    def _shortcut_cut(self) -> None:
+        if not self._focus_is_editing():
+            self.cut_selection()
+
+    def _shortcut_paste(self) -> None:
+        if not self._focus_is_editing():
+            self.paste()
+
+    def _shortcut_duplicate(self) -> None:
+        if not self._focus_is_editing():
+            self.duplicate()
+
+    def _shortcut_select_all(self) -> None:
+        if not self._focus_is_editing():
+            self.select_all()
+
+    # ------------------------------------------------------------------
+    # History (item 9: undo/redo)
+    # ------------------------------------------------------------------
+
+    def _install_history_shortcuts(self) -> None:
+        """Window-scoped undo/redo shortcuts (single binding, text-safe)."""
+        for seq, fn in (
+            (QKeySequence.StandardKey.Undo, self._shortcut_undo),
+            (QKeySequence.StandardKey.Redo, self._shortcut_redo),
+            (QKeySequence("Ctrl+Shift+Z"), self._shortcut_redo),
+        ):
+            QShortcut(seq, self, activated=fn)
+
+    def _shortcut_undo(self) -> None:
+        if not self._focus_is_editing():
+            self.undo()
+
+    def _shortcut_redo(self) -> None:
+        if not self._focus_is_editing():
+            self.redo()
+
+    def _restore_history(self, doc: dict) -> None:
+        """Rebuild the graph from a history snapshot without recording.
+
+        Node items are recreated by ``restore_graph``; the selection is
+        preserved by instance id so undo/redo keeps the Inspector context.
+        """
+        selected = {it.iid for it in self.selected_nodes()}
+        self._undo_active = True
+        try:
+            self.restore_graph(doc)
+        finally:
+            self._undo_active = False
+        if selected:
+            self._syncing_selection = True
+            try:
+                for item in self._node_items:
+                    item.set_selected(item.iid in selected)
+            finally:
+                self._syncing_selection = False
+            self._sync_inspector_to_scene()
+
+    def _graph_mutated(self, kind: str) -> None:
+        """Record the mutation and emit the change signal (single funnel)."""
+        self._record_current_state(kind)
+        self.graph_changed.emit()
+
+    def _record_current_state(self, kind: str) -> None:
+        """Fold the live graph into the history (post-mutation).
+
+        Called on every real canvas mutation (the graph_changed funnels).
+        Continuous gestures (drag, typing, spin boxes) keep replacing the
+        current slot while they reuse the same ``kind`` inside
+        ``UNDO_MERGE_WINDOW``, so they collapse into one undo step; a later
+        mutation truncates the redo future.
+        """
+        if self._undo_active or self._restoring or self._run_active:
+            return
+        kind = self._op_kind or kind
+        now = time.monotonic()
+        if (
+            self._last_kind == kind
+            and self._merge_since is not None
+            and now - self._merge_since <= UNDO_MERGE_WINDOW
+            and self._cursor == len(self._history) - 1
+        ):
+            # The current gesture is still underway: refresh the window clock
+            # and replace the current slot so undo lands on the final pose.
+            if self._history:
+                doc = self.document_snapshot()
+                if doc != self._history[self._cursor]:
+                    self._history[self._cursor] = doc
+            self._merge_since = now
+            return
+        del self._history[self._cursor + 1 :]
+        self._history.append(self.document_snapshot())
+        if len(self._history) > UNDO_LIMIT + 1:
+            del self._history[0]
+        self._cursor = len(self._history) - 1
+        self._last_kind = kind
+        self._merge_since = now
+        self._emit_history_state()
+
+    def undo(self) -> None:
+        """Step back one committed state (no-op during a run)."""
+        if self._run_active or self._undo_active or self._cursor <= 0:
+            return
+        self._cursor -= 1
+        self._restore_history(self._history[self._cursor])
+        self._merge_since = None
+        self._last_kind = None
+        self._emit_history_state()
+        self.history_applied.emit()
+
+    def redo(self) -> None:
+        """Re-apply the most recently undone state (no-op during a run)."""
+        if self._run_active or self._undo_active or self._cursor >= len(self._history) - 1:
+            return
+        self._cursor += 1
+        self._restore_history(self._history[self._cursor])
+        self._merge_since = None
+        self._last_kind = None
+        self._emit_history_state()
+        self.history_applied.emit()
+
+    def can_undo(self) -> bool:
+        return not self._run_active and self._cursor > 0
+
+    def can_redo(self) -> bool:
+        return not self._run_active and self._cursor < len(self._history) - 1
+
+    def _emit_history_state(self) -> None:
+        self.history_changed.emit(self.can_undo(), self.can_redo())
+
+    def clear_history(self) -> None:
+        """Reset history to the live graph (open/new/template boundaries)."""
+        self._history = [self.document_snapshot()]
+        self._cursor = 0
+        self._merge_since = None
+        self._last_kind = None
+        self._emit_history_state()
+
+    def document_snapshot(self) -> dict:
+        """Project document without view state (history + dirty comparison)."""
+        return {
+            k: v for k, v in self.serialize_graph().items() if k != "view"
+        }
+
+    def select_all(self) -> None:
+        """Select every node on the canvas."""
+        if not self._node_items:
+            return
+        self._syncing_selection = True
+        try:
+            for item in self._node_items:
+                item.set_selected(True)
+        finally:
+            self._syncing_selection = False
+        # The funnel updates state atomically (multi -> panel).
+        self._sync_inspector_to_scene()
+
+    def copy_selection(self) -> None:
+        """Write the selected subgraph to the system clipboard."""
+        selected = self.selected_nodes()
+        if not selected:
+            return
+        doc = self.serialize_graph()
+        iids = [item.iid for item in selected]
+        payload = extract_subgraph(doc["nodes"], doc["edges"], set(iids))
+        QApplication.clipboard().setText(encode_subgraph(payload))
+
+    def cut_selection(self) -> None:
+        """Copy the selection to the clipboard and delete it."""
+        if not self.selected_nodes():
+            return
+        self.copy_selection()
+        self.delete_selected()
+
+    def _clipboard_subgraph(self) -> dict | None:
+        return decode_subgraph(QApplication.clipboard().text())
+
+    def paste(self, offset: QPointF | None = None) -> list[NodeItem] | None:
+        """Paste a subgraph from the clipboard (in place, cascade via API).
+
+        New instance ids keep pasted copies isolated; internal edges are
+        re-created through ``_create_connection`` so compatibility and
+        exclusivity rules hold. External wires never cross the paste.
+        """
+        payload = self._clipboard_subgraph()
+        if payload is None or not payload["nodes"]:
+            self.message_requested.emit(
+                t("Clipboard does not contain a node graph"), "warning"
+            )
+            return None
+        new_items, _remap = self._materialize_subgraph(
+            payload["nodes"], payload["edges"], offset or QPointF(24, 24)
+        )
+        return new_items
+
+    def duplicate(self, rewire: bool = False) -> list[NodeItem] | None:
+        """Clone the current selection next to it.
+
+        ``rewire=True`` ("duplicate and rewire") also re-creates boundary
+        edges: input copies keep their providers, output copies feed every
+        free same-type input slot of the original destinations.
+        """
+        selected = self.selected_nodes()
+        if not selected:
+            return None
+        doc = self.serialize_graph()
+        iids = {item.iid for item in selected}
+        payload = extract_subgraph(doc["nodes"], doc["edges"], iids)
+        new_items, remap = self._materialize_subgraph(
+            payload["nodes"], payload["edges"], QPointF(24, 24)
+        )
+        if rewire:
+            self._rewire_boundary(payload["boundary"], remap)
+        return new_items
+
+    def _materialize_subgraph(
+        self, nodes_doc: list, edges_doc: list, offset: QPointF,
+    ) -> tuple[list[NodeItem], dict[str, NodeItem]]:
+        """Instantiate a subgraph with fresh ids (paste/duplicate core).
+
+        Guarded by ``_restoring`` so the Inspector does not churn per node;
+        the pasted items are selected as a unit afterwards. Returns the new
+        items plus the ``{old_iid: new_item}`` remap used by rewiring.
+        """
+        old_to_new: dict[str, NodeItem] = {}
+        new_items: list[NodeItem] = []
+        if not nodes_doc:
+            return new_items, old_to_new
+        self._restoring = True
+        try:
+            for entry in nodes_doc:
+                node_id = entry.get("id")
+                if not isinstance(node_id, str):
+                    continue
+                try:
+                    item = self.add_node(node_id)
+                except Exception:
+                    continue
+                old_iid = entry.get("iid")
+                item.iid = uuid.uuid4().hex[:8]
+                try:
+                    item.setPos(
+                        self.snap_point(
+                            QPointF(float(entry.get("x", 0)),
+                                    float(entry.get("y", 0))) + offset
+                        )
+                    )
+                except (TypeError, ValueError):
+                    pass
+                label = entry.get("label")
+                if isinstance(label, str) and label:
+                    item.set_label(label)
+                config = entry.get("config")
+                if isinstance(config, dict):
+                    item.apply_config(config)
+                if isinstance(old_iid, str):
+                    old_to_new[old_iid] = item
+                new_items.append(item)
+            for edge in edges_doc:
+                self._create_doc_edge(edge, old_to_new)
+        finally:
+            self._restoring = False
+        if new_items:
+            self._syncing_selection = True
+            try:
+                for item in self._node_items:
+                    item.set_selected(item in new_items)
+            finally:
+                self._syncing_selection = False
+            self._sync_inspector_to_scene()
+        self._graph_mutated("paste")
+        return new_items, old_to_new
+
+    def _create_doc_edge(self, edge: dict, old_to_new: dict) -> None:
+        """Re-create one internal edge across a remapped node set."""
+        src = old_to_new.get(edge.get("src"))
+        dst = old_to_new.get(edge.get("dst"))
+        if src is None or dst is None:
+            return
+        outs, ins = src.outputs(), dst.inputs()
+        out_i, in_i = edge.get("src_out"), edge.get("dst_in")
+        if not isinstance(out_i, int) or not isinstance(in_i, int):
+            return
+        if not (0 <= out_i < len(outs) and 0 <= in_i < len(ins)):
+            return
+        if not outs[out_i].can_connect_to(ins[in_i]) or ins[in_i].is_full():
+            return
+        self._create_connection(outs[out_i], ins[in_i])
+
+    def _rewire_boundary(self, boundary: list, old_to_new: dict) -> None:
+        """Re-create boundary edges of a duplicated selection.
+
+        Inbound (external provider -> copy) targets the same input index on
+        the fresh copy; outbound (copy -> external consumer) lands on the
+        first FREE input of the same type on the original destination
+        ("siguiente slot libre"); incompatible or full slots are skipped.
+        """
+        live = {item.iid: item for item in self._node_items}
+        for edge in boundary:
+            out_i = edge.get("src_out")
+            in_i = edge.get("dst_in")
+            if not isinstance(out_i, int) or not isinstance(in_i, int):
+                continue
+            if edge.get("src_selected") and edge.get("dst_selected"):
+                continue  # not a boundary edge
+            if not edge.get("src_selected") and not edge.get("dst_selected"):
+                continue  # external edge (both endpoints outside)
+            if edge.get("dst_selected"):
+                # Inbound: the original external provider -> the fresh copy.
+                src_item = live.get(edge.get("src"))
+                dst_item = old_to_new.get(edge.get("dst"))
+                if src_item is None or dst_item is None:
+                    continue
+                outs, ins = src_item.outputs(), dst_item.inputs()
+                if not (0 <= out_i < len(outs)) or not (0 <= in_i < len(ins)):
+                    continue
+                if not ins[in_i].is_full() and outs[out_i].can_connect_to(ins[in_i]):
+                    self._create_connection(outs[out_i], ins[in_i])
+                continue
+            # Outbound: the fresh copy -> the original consumer's first free
+            # input of the same type ("next free slot").
+            src_item = old_to_new.get(edge.get("src"))
+            dst_item = live.get(edge.get("dst"))
+            if src_item is None or dst_item is None:
+                continue
+            outs = src_item.outputs()
+            if not (0 <= out_i < len(outs)):
+                continue
+            in_type = edge.get("in_type")
+            for port in dst_item.inputs():
+                if port.port_type_id != in_type or port.is_full():
+                    continue
+                if port.group_conflict() is not None:
+                    continue
+                if outs[out_i].can_connect_to(port):
+                    self._create_connection(outs[out_i], port)
+                    break
+
+    def _queueable_selected(self) -> list:
+        """Selected items that accept a file queue (selection order)."""
+        return [
+            item for item in self.selected_nodes()
+            if getattr(item, "supports_file_queue", False)
+        ]
+
+    def _on_fleet_action(self, item: NodeItem, action: str) -> None:
+        """Node context-menu fleet actions: the whole selection when the
+        clicked item belongs to it, otherwise just the clicked item."""
+        selected = self.selected_nodes()
+        targets = selected if item in selected else [item]
+        if action == "delete":
+            self._syncing_selection = True
+            try:
+                for target in list(targets):
+                    self._remove_node(target)
+            finally:
+                self._syncing_selection = False
+            self._sync_inspector_to_scene()
+        elif action == "duplicate":
+            self._sync_selection_to(targets)
+            self.duplicate()
+        elif action == "duplicate_rewire":
+            self._sync_selection_to(targets)
+            self.duplicate(rewire=True)
+        elif action == "assign_files":
+            self._sync_selection_to(targets)
+            self.assign_files_to_selection()
+        elif action == "set_strategy":
+            self._batch_set_strategy("")
+        elif action == "paste":
+            self.paste()
+        elif action == "select_all":
+            self.select_all()
+
+    def _sync_selection_to(self, targets: list) -> None:
+        """Make exactly ``targets`` selected (used before fleet operations)."""
+        self._syncing_selection = True
+        try:
+            for other in self._node_items:
+                other.set_selected(other in targets)
+        finally:
+            self._syncing_selection = False
+
+    def _batch_set_strategy(self, key: str) -> None:
+        """Apply one strategy to every selected strategy node (homogeneous)."""
+        for item in self.selected_nodes():
+            if isinstance(item, StrategyNodeItem) and key != item.strategy():
+                self.set_strategy(item, key)
+
+    def assign_files_to_selection(self) -> None:
+        """Assign matched folder files to the queueable selection."""
+        items = self._queueable_selected()
+        if not items:
+            return
+        from lynceus.ui.nodes.widgets.assign_files_dialog import AssignFilesDialog
+
+        AssignFilesDialog(self, items).exec()
+
+    def contextMenuEvent(self, event) -> None:
+        """Empty-canvas right-click menu (items own their own menu)."""
+        super().contextMenuEvent(event)
+        if event.isAccepted():
+            return
+        target = self.itemAt(event.pos())
+        while target is not None and not isinstance(target, NodeItem):
+            target = target.parentItem()
+        if target is not None:
+            return
+        self._show_canvas_menu(event.globalPos())
+
+    def _show_canvas_menu(self, global_pos) -> None:
+        """Fleet menu for the empty canvas: select-all, paste, and the
+        selection-dependent batch actions (available after a rubber band)."""
+        menu = QMenu(self)
+        select_all = menu.addAction(t("Select All"))
+        select_all.triggered.connect(self.select_all)
+        paste = menu.addAction(t("Paste"))
+        paste.setShortcut(QKeySequence.StandardKey.Paste)
+        paste.triggered.connect(lambda: self.paste())
+        paste.setEnabled(self._clipboard_subgraph() is not None)
+        selected = self.selected_nodes()
+        if selected:
+            menu.addSeparator()
+            duplicate = menu.addAction(t("Duplicate"))
+            duplicate.setShortcut(QKeySequence("Ctrl+D"))
+            duplicate.triggered.connect(lambda: self.duplicate())
+            rewire = menu.addAction(t("Duplicate and reconnect"))
+            rewire.triggered.connect(lambda: self.duplicate(rewire=True))
+            strategy = self._strategy_selection_menu(menu)
+            if strategy is not None:
+                menu.addSeparator()
+                menu.addMenu(strategy)
+            if self._queueable_selected():
+                assign = menu.addAction(t("Assign files..."))
+                assign.triggered.connect(self.assign_files_to_selection)
+            menu.addSeparator()
+            delete = menu.addAction(t("Delete"))
+            delete.setShortcut(QKeySequence.StandardKey.Delete)
+            delete.triggered.connect(self.delete_selected)
+        menu.exec(global_pos)
+
+    def _strategy_selection_menu(self, parent) -> None:
+        """Build a "Set strategy..." submenu over the strategy families in
+        the selection; None when the selection has no strategy nodes."""
+        families: dict[str, list] = {}
+        for item in self.selected_nodes():
+            if isinstance(item, StrategyNodeItem):
+                families.setdefault(item.node_id(), []).append(item)
+        if not families:
+            return None
+        from PySide6.QtWidgets import QMenu
+
+        top = QMenu(t("Set strategy..."), parent)
+        for node_id, items in sorted(families.items()):
+            if len(families) > 1:
+                sub = top.addMenu(self._node_name(node_id))
+            else:
+                sub = top
+            for key, label in strategy_options(node_id):
+                action = sub.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(
+                    all(item.strategy() == key for item in items)
+                )
+                action.triggered.connect(
+                    lambda _checked=False, k=key: self._batch_set_strategy(k)
+                )
+            none_action = sub.addAction(t("(none)"))
+            none_action.setCheckable(True)
+            none_action.setChecked(
+                all(item.strategy() == "" for item in items)
+            )
+            none_action.triggered.connect(lambda: self._batch_set_strategy(""))
+        return top
+
+    # ------------------------------------------------------------------
     # Background grid and snap
     # ------------------------------------------------------------------
 
     def drawBackground(self, painter, rect) -> None:
         painter.fillRect(rect, CANVAS_BG)
+        # Whisper of depth: radial falloff toward the exposed edges. One
+        # fill, derived live from the background so themes follow. The
+        # radius overshoots the view so no circle edge is ever visible.
+        # Frame of reference is the viewport (stable across repaints):
+        # centering on the exposed rect shades every partial repaint
+        # differently, leaving dirty rectangles behind (rubber band on
+        # light themes).
+        vp = self.mapToScene(self.viewport().rect()).boundingRect()
+        center = vp.center()
+        radius = max(vp.width(), vp.height()) * 1.2
+        if radius > 0:
+            vignette = QRadialGradient(center, radius)
+            vignette.setColorAt(0.0, CANVAS_BG)
+            vignette.setColorAt(1.0, QColor(CANVAS_BG).darker(106))
+            painter.fillRect(rect, QBrush(vignette))
         painter.save()
         # Keep grid dots sharp by disabling antialiasing.
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
@@ -1182,6 +2286,9 @@ class NodeCanvasView(QGraphicsView):
             on_segment_started=self.segment_started.emit,
             on_segment_outputs=self.segment_outputs_changed.emit,
             on_consolidated_outputs=self.consolidated_outputs_ready.emit,
+            on_run_closed=self.pipeline_closed.emit,
+            on_barrier_outputs=self.barrier_outputs_changed.emit,
+            on_barrier_started=self.barrier_started.emit,
         )
 
     def _on_worker_node_status(self, iid: str, status: str) -> None:
@@ -1192,6 +2299,217 @@ class NodeCanvasView(QGraphicsView):
         item = self._item_by_iid.get(iid)
         if item is not None:
             self.node_status_changed.emit(item, status)
+
+    def _run_preflight(
+        self, nodes, source_paths: dict, queued_files: list[str] | None,
+    ):
+        """Header-only run sizing (item 44): overrides dict, or None to abort.
+
+        Best-effort and never a gate: unreadable sources just yield no
+        advice. Shown once per run/queue; the operator can suppress it
+        permanently or jump to the Performance preferences.
+        """
+        from lynceus.processing.preflight import build_preflight
+        from lynceus.processing.steps import discover_node_capabilities
+
+        if _setting_bool(PREFLIGHT_QUIET_KEY, False):
+            return {}
+        source_list = (
+            list(queued_files) if queued_files
+            else [p for p in source_paths.values() if p]
+        )
+        if not source_list:
+            return {}
+        prefs = _run_preferences()
+        factors = []
+        configs = self._pipeline_configs()
+        merge_on = False
+        has_mosaic = False
+        loader_iids: list[str] = []
+        for iid, _ in nodes:
+            item = self._item_by_iid.get(iid)
+            nid = item.node_id() if item is not None else ""
+            if not nid:
+                continue
+            caps = discover_node_capabilities(nid)
+            if caps.get("tile_task") is not None:
+                factors.append(caps.get("tile_weight_factor", 1.0))
+            if caps.get("triggers_tiling"):
+                loader_iids.append(iid)
+                if _config_int(configs, iid, "merge_sparse_below") > 0:
+                    merge_on = True
+            outputs = caps.get("output_files") or {}
+            if any(
+                str(name).lower().endswith((".tif", ".tiff"))
+                for name in outputs.values()
+            ):
+                has_mosaic = True
+        seg_cap = 0
+        seg_independent = False
+        if loader_iids:
+            first_cfg = configs.get(loader_iids[0]) or {}
+            seg_cap = _config_int(configs, loader_iids[0], "max_points_per_part")
+            # Schema default merges (True); only an explicit False counts
+            # as independent mode (junk stays on the safe default).
+            if "merge_segments" in first_cfg:
+                seg_independent = not first_cfg["merge_segments"]
+        advice = build_preflight(
+            source_list, factors,
+            workers=prefs["max_workers"],
+            budget_bytes=prefs["memory_budget_bytes"],
+            cache_enabled=prefs["keep_intermediates"],
+            merge_enabled=merge_on,
+            has_mosaic=has_mosaic,
+            total_ram_bytes=_total_ram_bytes(),
+            seg_cap=seg_cap,
+            segment_independent=seg_independent,
+        )
+        if advice is None or not advice.has_advice:
+            return {}
+        from lynceus.ui.preflight_dialog import (
+            OPEN_PERFORMANCE,
+            SHOW_LOADER,
+            PreflightDialog,
+        )
+
+        dialog = PreflightDialog(self, advice)
+        code = dialog.exec()
+        if dialog.dont_show_again():
+            QSettings(SETTINGS_ORG, SETTINGS_APP).setValue(
+                PREFLIGHT_QUIET_KEY, True
+            )
+        if code == OPEN_PERFORMANCE:
+            self.open_preferences_requested.emit("Performance")
+            return None
+        if code == SHOW_LOADER:
+            self._focus_loader(nodes)
+            return None
+        if code != QDialog.DialogCode.Accepted:
+            return None
+        if dialog.apply_merge_floor() and advice.merge_floor_suggest > 0:
+            self._apply_merge_floor(nodes, advice.merge_floor_suggest)
+        if dialog.apply_segments() > 0:
+            self._apply_segments(nodes, dialog.apply_segments())
+        overrides: dict = {}
+        if dialog.enable_cache() and not prefs["keep_intermediates"]:
+            overrides["keep_intermediates"] = True
+        if dialog.apply_workers() > 0:
+            overrides["max_workers"] = dialog.apply_workers()
+        if dialog.apply_memory() > 0:
+            overrides["memory_budget_bytes"] = dialog.apply_memory()
+        if dialog.apply_resolution() > 0:
+            self._apply_node_config(
+                nodes,
+                "resolution",
+                dialog.apply_resolution(),
+                lambda caps: isinstance(caps.get("config_schema"), dict)
+                and "resolution" in caps["config_schema"],
+            )
+        return overrides
+
+    def _merge_enabled(self, nodes) -> bool:
+        """Whether any loader in scope already fuses sparse tiles."""
+        from lynceus.processing.steps import discover_node_capabilities
+
+        configs = self._pipeline_configs()
+        for iid, _ in nodes:
+            item = self._item_by_iid.get(iid)
+            nid = item.node_id() if item is not None else ""
+            if not nid:
+                continue
+            if not discover_node_capabilities(nid).get("triggers_tiling"):
+                continue
+            if _config_int(configs, iid, "merge_sparse_below") > 0:
+                return True
+        return False
+
+    def _focus_loader(self, nodes) -> None:
+        """Select the first loader so its Tiling settings show in context."""
+        from lynceus.processing.steps import discover_node_capabilities
+
+        for iid, _ in nodes:
+            item = self._item_by_iid.get(iid)
+            if item is None:
+                continue
+            try:
+                caps = discover_node_capabilities(item.node_id())
+            except Exception:
+                continue
+            if caps.get("triggers_tiling"):
+                self._sync_selection_to([item])
+                self.ensureVisible(item)
+                return
+
+    def _apply_node_config(self, nodes, key: str, value, requires) -> int:
+        """Write one config key into matching nodes (project state).
+
+        Same funnel the Inspector uses per edit (stale mark + dirty + undo
+        history + refresh when selected), so a programmatic apply is
+        indistinguishable from typing the value by hand. ``requires`` takes
+        node capabilities; junk current values are overwritten, identical
+        ones skipped without dirtying. Returns the applied count.
+        """
+        from lynceus.processing.steps import discover_node_capabilities
+
+        applied = 0
+        for iid, _ in nodes:
+            item = self._item_by_iid.get(iid)
+            if item is None:
+                continue
+            try:
+                caps = discover_node_capabilities(item.node_id())
+            except Exception:
+                continue
+            if not requires(caps):
+                continue
+            config = item.pipeline_config()
+            if config.get(key) == value:
+                continue
+            config[key] = value
+            item.set_pipeline_config(config)
+            self.on_config_changed(iid)
+            if self._selected_item is item:
+                self.inspector_refresh_requested.emit()
+            applied += 1
+        return applied
+
+    def _apply_merge_floor(self, nodes, floor: int) -> None:
+        """Write the suggested floor into loader configs (project state).
+
+        Same funnel the Inspector uses per edit (stale mark + dirty + undo
+        history + refresh when selected), so a one-click apply is
+        indistinguishable from typing the value by hand: fingerprints,
+        manifest and saved projects all carry it. No phantom per-run
+        overrides.
+        """
+        try:
+            floor_value = int(floor)
+        except (TypeError, ValueError):
+            return
+        if floor_value <= 0:
+            return
+        self._apply_node_config(
+            nodes,
+            "merge_sparse_below",
+            floor_value,
+            lambda caps: bool(caps.get("triggers_tiling")),
+        )
+
+    def _apply_segments(self, nodes, cap: int) -> None:
+        """Write the suggested batch cap + independent mode into loaders.
+
+        Same Inspector funnel as every programmatic apply (dirty + undo +
+        refresh). Both keys travel in fingerprints, so reuse stays correct.
+        """
+        try:
+            cap_value = int(cap)
+        except (TypeError, ValueError):
+            return
+        if cap_value <= 0:
+            return
+        self._apply_node_config(
+            nodes, "max_points_per_part", cap_value, _is_loader_caps)
+        self._apply_node_config(nodes, "merge_segments", False, _is_loader_caps)
 
     def run_pipeline(self) -> None:
         if self._run_active:
@@ -1263,6 +2581,38 @@ class NodeCanvasView(QGraphicsView):
             )
             return
         in_scope = {iid for iid, _ in nodes}
+        # File queue: exactly one in-scope input with several queued files
+        # chains one run per file; more than one queued input disables the
+        # queue with a notice (single classic run on each head file).
+        queued_items = [
+            item for item in self._node_items
+            if item.iid in in_scope
+            and getattr(item, "supports_file_queue", False)
+            and len(item.file_queue()) > 1
+        ]
+        queue_item = None
+        queue_first: str | None = None
+        queue_existing: list[str] = []
+        if len(queued_items) > 1:
+            self._emit(
+                t(
+                    "File queue disabled: {names} have queued files — "
+                    "run one queue at a time"
+                ).format(names=", ".join(sorted(
+                    item.display_name() for item in queued_items))),
+                "warning",
+            )
+        elif len(queued_items) == 1:
+            from lynceus.nodes import _file_queue as fq
+
+            existing, _missing = fq.partition_existing(
+                queued_items[0].file_queue())
+            if existing:
+                queue_item = queued_items[0]
+                queue_first = existing[0]
+                queue_existing = existing
+            # All queued files vanished: fall through to the classic single
+            # run, which reports the vanished head file as usual.
         load_items = [
             item
             for item in self._node_items
@@ -1271,7 +2621,11 @@ class NodeCanvasView(QGraphicsView):
         ]
         source_paths: dict[str, str] = {}
         for item in load_items:
-            fp = item.file_path()
+            if queue_item is not None and item.iid == queue_item.iid:
+                # Prefiltered at detection: the queue head for this run.
+                fp = queue_first
+            else:
+                fp = item.file_path()
             if not fp:
                 if item.iid not in wired_iids:
                     # Unreachable: file-less orphan loaders never enter the
@@ -1289,16 +2643,35 @@ class NodeCanvasView(QGraphicsView):
             source_paths[item.iid] = fp
         # source_paths == {} => grafo barreras-only (Input Raster/Table/GPKG, ...)
         # (orphan loaders without a file are ignored by _pipeline_nodes).
+        # Pre-flight advisor (item 44): header-only sizing, once per run/queue.
+        # None means the operator aborted or jumped to Performance; a dict
+        # carries per-run preference overrides (e.g. cache for this run).
+        preflight_overrides = self._run_preflight(
+            nodes, source_paths, queue_existing if queue_item else None
+        )
+        if preflight_overrides is None:
+            self._sync_toolbar_state("idle")
+            return
+        # Item 43: configurable output root (Preferences > General). Mapped
+        # each run so a live change applies on the next run without reopening.
+        self.session_root = resolve_output_root(
+            str(QSettings(SETTINGS_ORG, SETTINGS_APP).value(OUTPUT_ROOT_KEY, ""))
+        )
         # Isolated snapshot of the canvas: the run executes this; any later
         # edit (nodes/cables/config) stays "pending" and does not
         # affect the session until the next run (see _ask_apply_pending).
         self._graph_snapshot = self.serialize_graph()
         self._run_active = True
+        self._emit_history_state()  # undo/redo disable while the run lasts
         # Reset gallery accumulation for this run: segments publish themselves
         # incrementally; the consolidated/final products fill the last block.
         self._had_segments = False
         self._segment_products = {}
         self._flat_products = []
+        self._live_products = {}
+        self._batch_active = False
+        self._live_notice_shown = False
+        self._live_notice_text = ""
         chip = getattr(self, "_segment_chip", None)
         if chip is not None:
             chip.hide()
@@ -1307,10 +2680,17 @@ class NodeCanvasView(QGraphicsView):
         self._set_run_pending(True)
         self._sync_toolbar_state("running")
         run_prefs = _run_preferences()
+        run_prefs.update(preflight_overrides or {})
         self._pipeline.set_acceleration_mode(run_prefs["acceleration_mode"])
         self._pipeline.set_acceleration_backend(
             run_prefs["acceleration_backend"], run_prefs["acceleration_device"]
         )
+        if queue_item is not None:
+            self._start_file_queue(
+                queue_item, nodes, self._typed_edges(), source_paths,
+                self._pipeline_configs(), run_prefs,
+            )
+            return
         self._pipeline.run(
             nodes, self._typed_edges(), source_paths,
             self._pipeline_callbacks(), session_root=self.session_root,
@@ -1322,6 +2702,10 @@ class NodeCanvasView(QGraphicsView):
         )
 
     def cancel_pipeline(self) -> None:
+        if self._file_queue is not None:
+            # Stop cancels the whole queue: the current run cancels now and
+            # the post-cleanup closed signal finishes with a partial summary.
+            self._file_queue["stop"] = True
         self._sync_toolbar_state("cancelling")
         self.message_requested.emit(t("Cancelling pipeline…"), "action")
         self._pipeline.cancel()
@@ -1422,7 +2806,7 @@ class NodeCanvasView(QGraphicsView):
         if item is None or item.scene() is None:
             return
         item.set_label(text)
-        self.graph_changed.emit()
+        self._graph_mutated("label")
         if self._selected_item is item:
             self.inspector_refresh_requested.emit()
 
@@ -1480,13 +2864,18 @@ class NodeCanvasView(QGraphicsView):
         item.close_requested.connect(lambda: self._remove_node(item))
         item.selected.connect(self._select_node)
         item.moved.connect(self._update_node_wires)
-        item.moved.connect(lambda _item: self.graph_changed.emit())
+        item.moved.connect(lambda _item: self._graph_mutated("move"))
         item.port_pressed.connect(self._start_wire)
         item.message_requested.connect(
             lambda text: self.message_requested.emit(text, "info")
         )
         item.label_edit_requested.connect(self._start_label_edit)
         item.preview_requested.connect(self._on_node_preview_requested)
+        if hasattr(item, "queue_manage_requested"):
+            item.queue_manage_requested.connect(
+                lambda it=item: self._manage_file_queue(it)
+            )
+        item.fleet_action_requested.connect(self._on_fleet_action)
         item.selected_items_provider = self.selected_nodes
         if isinstance(item, StrategyNodeItem):
             item.strategy_change_requested.connect(
@@ -1494,13 +2883,13 @@ class NodeCanvasView(QGraphicsView):
             )
         if hasattr(item, "file_changed"):
             item.file_changed.connect(
-                lambda _it=item: self.graph_changed.emit()
+                lambda _it=item: self._graph_mutated("file")
             )
 
         self._scene.addItem(item)
         self._node_items.append(item)
         self._select_node(item)
-        self.graph_changed.emit()
+        self._graph_mutated("add")
         return item
 
     def _on_theme_changed(self, _theme_id: str) -> None:
@@ -1551,9 +2940,8 @@ class NodeCanvasView(QGraphicsView):
             self._node_items.remove(item)
             self._scene.removeItem(item)
             if self.selected_item() is item and not self._syncing_selection:
-                self._selected_item = None
-                self.node_selected.emit(None)
-            self.graph_changed.emit()
+                self._blank_inspector()
+            self._graph_mutated("remove")
 
     def selected_nodes(self) -> list:
         """Currently selected items (native and custom flags are synced)."""
@@ -1572,11 +2960,12 @@ class NodeCanvasView(QGraphicsView):
             self._sync_inspector_to_scene()
 
     def _sync_inspector_to_scene(self) -> None:
-        """Single-or-None inspector rule from the live scene selection.
+        """Inspector rule from the live scene selection.
 
-        Exactly one selected node shows its config; zero or several show
-        the placeholder. Emits only on change (scene signals fire per item
-        during bulk updates, and several canvas paths already emit None).
+        Exactly one selected node shows its config; several show the
+        multi-selection panel (``nodes_selected``); zero shows the
+        placeholder. Emits only on change (scene signals fire per item
+        during bulk updates, and several canvas paths already blank it).
         """
         if self._restoring or self._syncing_selection:
             return
@@ -1585,9 +2974,30 @@ class NodeCanvasView(QGraphicsView):
             item = selected[0]
             if self._selected_item is not item:
                 self._selected_item = item
+                self._inspector_multi = None
+                self._inspector_busy = True
                 self.node_selected.emit(item)
-        elif self._selected_item is not None:
+            return
+        if len(selected) > 1:
             self._selected_item = None
+            items = list(selected)
+            if items != self._inspector_multi:
+                self._inspector_multi = items
+                self._inspector_busy = True
+                self.nodes_selected.emit(items)
+            return
+        self._selected_item = None
+        self._inspector_multi = None
+        if self._inspector_busy:
+            self._inspector_busy = False
+            self.node_selected.emit(None)
+
+    def _blank_inspector(self) -> None:
+        """Force the placeholder (bulk deletes, graph clear, background click)."""
+        self._selected_item = None
+        self._inspector_multi = None
+        if self._inspector_busy:
+            self._inspector_busy = False
             self.node_selected.emit(None)
 
     def selected_item(self) -> NodeItem | None:
@@ -1603,10 +3013,16 @@ class NodeCanvasView(QGraphicsView):
     def on_config_changed(self, iid: str) -> None:
         """Inspector edit: configuration changes never affect a running session,
         so the node just goes stale (strategy changes arrive via
-        ``on_strategy_requested``, which keeps canvas and Inspector in sync)."""
+        ``on_strategy_requested``, which keeps canvas and Inspector in sync).
+
+        The value is already written by the Inspector when this arrives, so
+        the mutation joins the undo history here (post-mutation record) and
+        marks the project dirty.
+        """
         for item in self._node_items:
             if item.iid == iid:
                 item.mark_stale()
+                self._graph_mutated("config")
                 return
 
     def on_strategy_requested(self, iid: str, key: str) -> None:
@@ -1627,27 +3043,33 @@ class NodeCanvasView(QGraphicsView):
         """
         if not isinstance(item, StrategyNodeItem) or key == item.strategy():
             return
-        for connection in [
-            c
-            for c in self._connections
-            if c.source.node is item or c.target.node is item
-        ]:
-            self._disconnect(connection)
-        item.set_strategy(key)
-        item.mark_stale()
+        # One undo step for the whole change: cutting the cables belongs to it.
+        self._op_kind = "strategy"
+        try:
+            for connection in [
+                c
+                for c in self._connections
+                if c.source.node is item or c.target.node is item
+            ]:
+                self._disconnect(connection)
+            item.set_strategy(key)
+            item.mark_stale()
+        finally:
+            self._op_kind = None
         self._update_node_wires(item)
         if self._selected_item is item:
             self.inspector_refresh_requested.emit()
-        self.graph_changed.emit()
+        self._graph_mutated("strategy")
 
     def on_node_renamed(self, _iid: str) -> None:
         """Renamed from the Inspector: cosmetic, marks the project dirty."""
-        self.graph_changed.emit()
+        self._graph_mutated("label")
 
     def retranslate_items(self) -> None:
         """Re-apply translations to the item labels."""
         for item in self._node_items:
             item.retranslate()
+        self._update_pending_chip()
 
     def _update_node_wires(self, item: NodeItem) -> None:
         for connection in self._connections:
@@ -1663,18 +3085,24 @@ class NodeCanvasView(QGraphicsView):
 
     def clear_graph(self) -> None:
         """Removes all nodes and connections from the canvas."""
-        for connection in list(self._connections):
-            self._disconnect(connection)
-        self._syncing_selection = True
+        # Restoring/opening must not pollute the undo history with the
+        # intermediate disconnects this method emits.
+        prev_restoring = self._restoring
+        self._restoring = True
         try:
-            for item in list(self._node_items):
-                item.on_node_removed()
-                self._scene.removeItem(item)
-            self._node_items.clear()
+            for connection in list(self._connections):
+                self._disconnect(connection)
+            self._syncing_selection = True
+            try:
+                for item in list(self._node_items):
+                    item.on_node_removed()
+                    self._scene.removeItem(item)
+                self._node_items.clear()
+            finally:
+                self._syncing_selection = False
         finally:
-            self._syncing_selection = False
-        self._selected_item = None
-        self.node_selected.emit(None)
+            self._restoring = prev_restoring
+        self._blank_inspector()
 
     def serialize_graph(self) -> dict:
         """Live graph as a project document: nodes, edges and view.
@@ -1750,12 +3178,19 @@ class NodeCanvasView(QGraphicsView):
                 item.setPos(float(entry.get("x", 0)), float(entry.get("y", 0)))
             except (TypeError, ValueError):
                 pass
-            label = entry.get("label")
-            if isinstance(label, str) and label:
-                item.set_label(label)
-            config = entry.get("config")
-            if isinstance(config, dict):
-                item.apply_config(config)
+            try:
+                entry_label = entry.get("label")
+                if isinstance(entry_label, str):
+                    item.set_label(entry_label)  # empty clears previous
+                config = entry.get("config")
+                if isinstance(config, dict):
+                    item.apply_config(config)
+            except Exception as exc:  # corrupt per-node state: keep defaults
+                warnings.append(
+                    t("Node kept with defaults ({node_id}): {exc}").format(
+                        node_id=node_id, exc=exc
+                    )
+                )
 
         def resolve_endpoint(ref):
             """Endpoint iid: by iid (v2) or by module (legacy v1).
@@ -1816,21 +3251,22 @@ class NodeCanvasView(QGraphicsView):
                 continue
             self._create_connection(outs[out_i], ins[in_i])
 
-        view = data.get("view") or {}
-        try:
-            scale = float(view.get("scale", 1.0))
-        except (TypeError, ValueError):
-            scale = 1.0
-        scale = max(MIN_ZOOM, min(MAX_ZOOM, scale))
-        try:
-            cx = float(view.get("cx", 0))
-            cy = float(view.get("cy", 0))
-        except (TypeError, ValueError):
-            cx = cy = 0.0
-        self.resetTransform()
-        self.scale(scale, scale)
-        self.centerOn(cx, cy)
-        self.zoomChanged.emit(self.transform().m11())
+        view = data.get("view")
+        if isinstance(view, dict) and view:
+            try:
+                scale = float(view.get("scale", 1.0))
+            except (TypeError, ValueError):
+                scale = 1.0
+            scale = max(MIN_ZOOM, min(MAX_ZOOM, scale))
+            try:
+                cx = float(view.get("cx", 0))
+                cy = float(view.get("cy", 0))
+            except (TypeError, ValueError):
+                cx = cy = 0.0
+            self.resetTransform()
+            self.scale(scale, scale)
+            self.centerOn(cx, cy)
+            self.zoomChanged.emit(self.transform().m11())
         self._restoring = False
         self._selected_item = None
         self._syncing_selection = True
@@ -1851,7 +3287,8 @@ class NodeCanvasView(QGraphicsView):
         self._ghost_item = QGraphicsPathItem()
         ghost = QColor(get_port_color(port.port_type_id)).darker(125)
         self._ghost_item.setPen(
-            QPen(ghost, WIRE_WIDTH, Qt.PenStyle.DashLine)
+            QPen(ghost, WIRE_WIDTH, Qt.PenStyle.DashLine,
+                 Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         )
         self._ghost_item.setZValue(0)
         self._scene.addItem(self._ghost_item)
@@ -1905,7 +3342,10 @@ class NodeCanvasView(QGraphicsView):
             return
 
         path_item = QGraphicsPathItem()
-        path_item.setPen(QPen(QColor(get_port_color(source.port_type_id)), WIRE_WIDTH))
+        path_item.setPen(QPen(QColor(get_port_color(source.port_type_id)),
+                                 WIRE_WIDTH, Qt.PenStyle.SolidLine,
+                                 Qt.PenCapStyle.RoundCap,
+                                 Qt.PenJoinStyle.RoundJoin))
         path_item.setFlags(
             path_item.flags() | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
         )
@@ -1921,7 +3361,7 @@ class NodeCanvasView(QGraphicsView):
         self._update_connection_path(connection)
         source.node.on_connection_changed()
         target.node.on_connection_changed()
-        self.graph_changed.emit()
+        self._graph_mutated("connect")
 
     def _disconnect(self, connection: Connection) -> None:
         if connection in self._connections:
@@ -1933,7 +3373,7 @@ class NodeCanvasView(QGraphicsView):
             self._scene.removeItem(connection.path_item)
             connection.source.node.on_connection_changed()
             connection.target.node.on_connection_changed()
-            self.graph_changed.emit()
+            self._graph_mutated("disconnect")
 
     def _update_connection_path(self, connection: Connection) -> None:
         start = self._port_scene_pos(connection.source)
@@ -1990,19 +3430,17 @@ class NodeCanvasView(QGraphicsView):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
+        if event.button() == Qt.MouseButton.RightButton:
+            # Right-click never reaches the scene: a press on empty space
+            # would clear a multi-selection before its menu opens, showing
+            # the bare-canvas menu instead of the fleet one. The menu itself
+            # travels via contextMenuEvent (items own theirs, the canvas
+            # shows selection actions when anything is selected).
+            event.accept()
+            return
+        # Left-press on empty space falls through to the base class, which
+        # owns the rubber-band selection (replace by default, Ctrl to add).
         super().mousePressEvent(event)
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and self.itemAt(event.position().toPoint()) is None
-        ):
-            self._selected_item = None
-            self._syncing_selection = True
-            try:
-                for item in self._node_items:
-                    item.set_selected(False)
-            finally:
-                self._syncing_selection = False
-            self._sync_inspector_to_scene()
 
     def mouseMoveEvent(self, event) -> None:
         if self._wire_source is not None:

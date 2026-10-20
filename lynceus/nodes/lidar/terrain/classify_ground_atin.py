@@ -20,6 +20,12 @@ PROCESSING_SPECS = {
     "point_cloud_dir": "classified",
     "provides": {"classified": True},
     "output_globs": ("classified/**/*.laz",),
+    # Full-cloud decode retained as x/y/z plus mask and TIN seeding arrays.
+    "tile_weight_factor": 1.5,
+    # Point-grid working set (POINT_GRID_BYTES_PER_CELL): the seed grid
+    # scales with tile AREA at atin_cell_size, not with points.
+    "grid_bytes_per_cell": 96,
+    "grid_resolution_keys": ("atin_cell_size", "cell_size"),
     "config_schema": {
         "atin_seed_m": {
             "type": "float",

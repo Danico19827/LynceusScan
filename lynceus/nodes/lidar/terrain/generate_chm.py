@@ -126,10 +126,12 @@ def barrier_generate_chm(ctx: dict) -> dict:
 
     from lynceus.processing import provenance
     from lynceus.processing.raster import (
-        _valid_bounds,
+        _raster_shape,
         compute_chm,
         fill_holes,
         read_geotiff,
+        smooth_nodata,
+        stack_mosaic,
         write_geotiff,
     )
 
@@ -143,17 +145,21 @@ def barrier_generate_chm(ctx: dict) -> dict:
         raise RuntimeError("CHM requires both DTM and DSM mosaics")
     out_path = scoped_file(ctx, "chm_mosaic.tif")
     nodata = ctx.get("nodata_value", -9999.0)
+    budget = ctx.get("_raster_grid_memory_budget_bytes")
+    pit_free = bool(ctx.get("pit_free", False))
+    out_res = float(ctx.get("output_resolution", 0.0) or 0.0)
+    smooth_on = bool(ctx.get("smooth_enabled", True))
+    sigma = float(ctx.get("smooth_sigma", 0.5)) if smooth_on else 0.0
+    fill_gap = bool(ctx.get("fill_gaps", False))
+    max_h = float(ctx.get("max_height_m", 60.0))
+    min_h = float(ctx.get("min_height_m", 0.0))
 
-    dtm_arr, dtm_transform, crs_dtm = read_geotiff(dtm)
-    dsm_arr, dsm_transform, crs_dsm = read_geotiff(dsm)
-    if (
-        _valid_bounds(dtm_arr, dtm_transform, nodata) is None
-        or _valid_bounds(dsm_arr, dsm_transform, nodata) is None
-    ):
-        # Nothing to subtract: an all-NODATA CHM is faithful to the empty
-        # stream instead of dying. The NODATA cell of the DTM canvas keeps
-        # the raster registered with the session grid.
-        grid = np.full(dtm_arr.shape, nodata, dtype=np.float32)
+    def _all_nodata_grid():
+        # Nothing to subtract: an all-NODATA CHM is faithful to the
+        # empty stream instead of dying. The NODATA cell of the DTM
+        # canvas keeps the raster registered with the session grid.
+        width, height, dtm_transform, _, _ = _raster_shape(dtm)
+        grid = np.full((height, width), nodata, dtype=np.float32)
         write_geotiff(
             out_path, grid, dtm_transform, crs=ctx.get("crs"),
             nodata=nodata, metadata=prov_doc,
@@ -162,58 +168,137 @@ def barrier_generate_chm(ctx: dict) -> dict:
             "file": out_path,
             "kind": "CHM",
             "node": NODE_ID,
-            "warnings": ["DTM or DSM without valid data; CHM written as all-NODATA"],
+            "warnings": [
+                "DTM or DSM without valid data; CHM written as all-NODATA"
+            ],
         }
 
-    if ctx.get("pit_free", False):
-        from lynceus.processing.raster import pit_free_canopy
+    def legacy(plan):
+        from lynceus.processing.raster import _chm_refuse
 
-        dsm_arr = pit_free_canopy(dsm_arr, nodata)
+        # Size the refusal past the union: windowed phases track the
+        # overlap, full-read phases (pit) the union. compute_chm re-checks
+        # before its own reads with the same plan (no re-streaming).
+        _chm_refuse(plan, [dtm, dsm], budget, smooth_on,
+                    out_res > 0, pit_free)
+        if pit_free:
+            from lynceus.processing.raster import pit_free_canopy
 
-    compute_chm(
-        dtm, dsm, out_path, crs=clean_crs(ctx.get("crs")) or crs_dtm or crs_dsm,
-        nodata=nodata,
-        smooth_enabled=ctx.get("smooth_enabled", True),
-        smooth_sigma=ctx.get("smooth_sigma", 0.5),
-        max_height_m=ctx.get("max_height_m", 60.0),
-        min_height_m=ctx.get("min_height_m", 0.0),
-        metadata=prov_doc,
-        dtm_arr=dtm_arr, dtm_transform=dtm_transform,
-        dsm_arr=dsm_arr, dsm_transform=dsm_transform,
+            dtm_arr, dtm_transform, crs_dtm = read_geotiff(dtm)
+            dsm_arr, dsm_transform, crs_dsm = read_geotiff(dsm)
+            dsm_arr = pit_free_canopy(dsm_arr, nodata)
+            compute_chm(
+                dtm, dsm, out_path,
+                crs=clean_crs(ctx.get("crs")) or crs_dtm or crs_dsm,
+                nodata=nodata,
+                smooth_enabled=smooth_on,
+                smooth_sigma=sigma,
+                max_height_m=max_h,
+                min_height_m=min_h,
+                metadata=prov_doc,
+                dtm_arr=dtm_arr, dtm_transform=dtm_transform,
+                dsm_arr=dsm_arr, dsm_transform=dsm_transform,
+                memory_budget_bytes=budget,
+                _overlap_plan=plan,
+            )
+        else:
+            compute_chm(
+                dtm, dsm, out_path, crs=clean_crs(ctx.get("crs")),
+                nodata=nodata,
+                smooth_enabled=smooth_on,
+                smooth_sigma=sigma,
+                max_height_m=max_h,
+                min_height_m=min_h,
+                metadata=prov_doc,
+                memory_budget_bytes=budget,
+                _overlap_plan=plan,
+            )
+
+        # Optional gap filling (native resolution: one-cell gaps by default).
+        if fill_gap:
+            arr, transform, crs = read_geotiff(out_path)
+            res = abs(float(transform.a))
+            arr = fill_holes(arr, res, res, nodata)
+            write_geotiff(out_path, arr, transform, crs=crs, nodata=nodata,
+                          metadata=prov_doc)
+
+        # Optional resolution override (standard write path: diff unchanged).
+        if out_res > 0:
+            import rasterio
+            from rasterio.warp import reproject, calculate_default_transform
+
+            with rasterio.open(out_path) as src:
+                dst_transform, dst_width, dst_height = (
+                    calculate_default_transform(
+                        src.crs, src.crs, src.width, src.height, *src.bounds,
+                        resolution=out_res,
+                    )
+                )
+                kwargs = src.meta.copy()
+                kwargs.update({
+                    "crs": src.crs,
+                    "transform": dst_transform,
+                    "width": dst_width,
+                    "height": dst_height,
+                })
+                with rasterio.open(out_path, "w", **kwargs) as dst:
+                    reproject(
+                        source=rasterio.band(src, 1),
+                        destination=rasterio.band(dst, 1),
+                    )
+        return {"file": out_path, "kind": "CHM", "node": NODE_ID}
+
+    from lynceus.processing.raster import (
+        _chm_overlap_plan,
+        _chm_peak_need,
+        _mosaic_plan,
     )
 
-    # Optional gap filling (native resolution: one-cell gaps by default).
-    if ctx.get("fill_gaps", False):
-        arr, transform, crs = read_geotiff(out_path)
-        res = abs(float(transform.a))
-        arr = fill_holes(arr, res, res, nodata)
-        write_geotiff(out_path, arr, transform, crs=crs, nodata=nodata, metadata=prov_doc)
+    # One streaming plan serves emptiness, routing and refusal alike.
+    plan = _chm_overlap_plan(str(dtm), str(dsm), nodata)
+    if plan["empty_dtm"] or plan["empty_dsm"]:
+        return _all_nodata_grid()
 
-    # Optional resolution override (standard write path: deflate + tags).
-    out_res = ctx.get("output_resolution", 0.0)
-    if out_res > 0:
-        import rasterio
-        from rasterio.warp import reproject, calculate_default_transform
+    # Shift-variant (pit-free composite) and resampling paths stay direct,
+    # as do unstackable grids and budget-less runs (historical direct).
+    # Anything else routes by the SAME peak formula the refusal uses, so
+    # the two can never disagree again: honestly fitting unions go direct
+    # (fast), the rest streams window by window through stack_mosaic.
+    if pit_free or out_res > 0 or not budget:
+        return legacy(plan)
+    if "skipped" in _mosaic_plan([dtm, dsm]):
+        return legacy(plan)
+    try:
+        budget_bytes = int(budget)
+    except (TypeError, ValueError):
+        return legacy(plan)
+    if budget_bytes <= 0:
+        return legacy(plan)
+    if _chm_peak_need(plan, smooth=smooth_on, outres=out_res > 0,
+                       pit=False) <= budget_bytes:
+        return legacy(plan)
 
-        with rasterio.open(out_path) as src:
-            dst_transform, dst_width, dst_height = calculate_default_transform(
-                src.crs, src.crs, src.width, src.height,
-                *src.bounds, resolution=out_res,
-            )
-            src_crs = str(src.crs) if src.crs else None
-            dst = np.full((dst_height, dst_width), nodata, dtype=np.float32)
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=dst,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=dst_transform,
-                dst_crs=src.crs,
-                dst_nodata=nodata,
-            )
-        write_geotiff(
-            out_path, dst, dst_transform, crs=clean_crs(ctx.get("crs")) or src_crs,
-            nodata=nodata, metadata=prov_doc,
-        )
+    res = abs(float(_raster_shape(dtm)[2].a))
+    halo = (int(4.0 * sigma) + 1 if sigma > 0 else 0) + (1 if fill_gap else 0)
 
+    def chm_op(wins, info):
+        nd = info["nodata"]
+        dtm_w, dsm_w = (np.asarray(w, dtype=np.float32) for w in wins)
+        both = (dtm_w != nd) & (dsm_w != nd)
+        chm = np.full(dtm_w.shape, nd, dtype=np.float32)
+        if both.any():
+            vals = dsm_w[both] - dtm_w[both]
+            chm[both] = np.clip(vals, min_h, max_h)
+        if sigma > 0:
+            chm = smooth_nodata(chm, sigma, nd)
+        if fill_gap:
+            chm = fill_holes(chm, res, res, nd)
+        return chm
+
+    stack_mosaic(
+        [dtm, dsm], out_path, op=chm_op, halo_cells=halo,
+        extent="intersection", nodata=nodata, metadata=prov_doc,
+        memory_budget_bytes=budget,
+        notes=ctx.setdefault("_bounded_notes", []),
+    )
     return {"file": out_path, "kind": "CHM", "node": NODE_ID}

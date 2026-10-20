@@ -3,18 +3,33 @@
 """Live theme application: QSS regeneration and painted constants."""
 
 import os
+import re
 import unittest
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from lynceus.plugins.theme import THEME_ROLES, theme_manager
 from lynceus.ui.theming import (
+    _ROLE_FOR_HEX,
     apply_theme,
     available_themes,
     build_stylesheet,
     qss_template,
     theme_changed,
 )
+
+ROOT = Path(__file__).resolve().parent.parent
+_PACKS = ROOT / "extensions" / "locales"
+
+# Semantic one-offs that must NOT follow the theme (status chips, notice
+# blocks, viewer ramps): documented in theming.py, frozen here so a newly
+# fixed hex is a deliberate decision, never an accident.
+FIXED_HEXES = frozenset({
+    "#0c241a", "#151c2a", "#1f2740", "#241c0c", "#2e6a4a", "#3a2a2a",
+    "#6a541e", "#7ec4a1", "#e0b45a", "#7aa8d4", "#d4a94e", "#6ec87a",
+    "#d46a6a",
+})
 
 
 class StylesheetTests(unittest.TestCase):
@@ -43,6 +58,78 @@ class StylesheetTests(unittest.TestCase):
     def test_no_fixed_alpha_backgrounds(self) -> None:
         # A fixed rgba() can never follow a theme (notice tray regression).
         self.assertNotIn("rgba(", qss_template())
+
+    def test_every_hex_is_a_theme_role_or_documented_fixed(self) -> None:
+        # A hex outside _ROLE_FOR_HEX freezes across themes: light packs
+        # would inherit a dark color (white-button class of bug). New fixed
+        # hexes must join FIXED_HEXES deliberately.
+        found = {
+            match.group(0).lower()
+            for match in re.finditer(r"#[0-9a-fA-F]{6}", qss_template())
+        }
+        self.assertEqual(found - set(_ROLE_FOR_HEX) - FIXED_HEXES, set())
+
+    def test_native_faced_widgets_have_explicit_colors(self) -> None:
+        # Buttons, checkboxes, lists and sliders render their face natively:
+        # without explicit rules the face follows the OS theme while the
+        # text follows the palette (white-on-white on light Windows).
+        template = qss_template()
+        for selector in ("QPushButton", "QCheckBox", "QListWidget",
+                         "QSlider::groove:horizontal"):
+            match = re.search(
+                r"^" + re.escape(selector) + r"\s*\{([^}]*)\}",
+                template,
+                re.MULTILINE,
+            )
+            self.assertIsNotNone(match, selector)
+            block = match.group(1)
+            self.assertIn("color", block, selector)
+
+    @staticmethod
+    def _contrast_ratio(back: str, fore: str) -> float:
+        def luminance(hex_color: str) -> float:
+            rgb = [int(hex_color[i : i + 2], 16) / 255.0 for i in (1, 3, 5)]
+
+            def channel(value: float) -> float:
+                if value <= 0.03928:
+                    return value / 12.92
+                return ((value + 0.055) / 1.055) ** 2.4
+
+            channels = [channel(v) for v in rgb]
+            return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+        lighter = luminance(back)
+        darker = luminance(fore)
+        if darker > lighter:
+            lighter, darker = darker, lighter
+        return (lighter + 0.05) / (darker + 0.05)
+
+    def _rule_colors(self, css: str, selector: str) -> tuple[str, str]:
+        match = re.search(
+            r"^" + re.escape(selector) + r"\s*\{([^}]*)\}",
+            css,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(match, selector)
+        block = match.group(1)
+        back = re.search(r"background-color:\s*(#[0-9a-fA-F]{6})", block)
+        fore = re.search(r"^\s*color:\s*(#[0-9a-fA-F]{6})", block,
+                         re.MULTILINE)
+        self.assertIsNotNone(back, selector)
+        self.assertIsNotNone(fore, selector)
+        return back.group(1), fore.group(1)
+
+    def test_button_and_list_contrast_in_dark_and_light(self) -> None:
+        # The reported bug: light text on a light native face. Explicit
+        # faces must contrast AA (>= 4.5) in every shipped palette.
+        for palette in (dict(THEME_ROLES),
+                        theme_manager.palette("light")):
+            css = build_stylesheet(qss_template(), palette)
+            for selector in ("QPushButton", "QListWidget"):
+                back, fore = self._rule_colors(css, selector)
+                ratio = self._contrast_ratio(back, fore)
+                self.assertGreaterEqual(
+                    ratio, 4.5, f"{selector} {back} vs {fore}")
 
     def test_menu_logo_tint_matches_theme_text(self) -> None:
         import io
@@ -151,6 +238,8 @@ class LiveApplyTests(unittest.TestCase):
             ).sum(axis=2)
             self.assertGreater(int(((dist <= 30) & opaque).sum()), 100)
 
+    @unittest.skipUnless(
+        _PACKS.is_dir(), "locale packs not present in this checkout")
     def test_prefs_dialog_retranslates_while_open(self) -> None:
         from lynceus.plugins.locale import locale_manager
         from lynceus.ui.preferences_dialog import PreferencesDialog

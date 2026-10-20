@@ -33,8 +33,16 @@ def barrier_consolidate_vegetation(ctx: dict) -> dict:
         _sidecar_meta,
     )
     from lynceus.nodes.lidar.analysis.grid_vegetation import (
+        _veg_polygons,
         finalize_vegetation_frame,
         merge_vegetation_frames,
+        merge_vegetation_stream,
+    )
+    from lynceus.processing.chunked_merge import (
+        append_gpkg,
+        init_gpkg,
+        note_streamed,
+        tables_fit,
     )
 
     import geopandas as gpd
@@ -44,13 +52,6 @@ def barrier_consolidate_vegetation(ctx: dict) -> dict:
         raise RuntimeError(
             "Consolidation has no segment tables for grid vegetation"
         )
-    frames = []
-    for path in files:
-        frame = gpd.read_file(path)
-        if frame is not None and len(frame) > 0:
-            frames.append(frame)
-    if not frames:
-        raise RuntimeError("Segment tables are empty; nothing to consolidate")
     nodata = float(ctx.get("nodata_value", -9999.0))
     res = float(ctx.get("resolution", 1.0))
     threshold_m = float(ctx.get("canopy_threshold_m", 2.0))
@@ -67,15 +68,85 @@ def barrier_consolidate_vegetation(ctx: dict) -> dict:
             threshold_m = float(meta["canopy_threshold_m"])
         if isinstance(meta.get("lai_k"), (int, float)):
             lai_k = float(meta["lai_k"])
-    gids, cols, rows, hists, n = merge_vegetation_frames(frames)
-    finals = finalize_vegetation_frame(
-        gids, cols, rows, hists, n, res, threshold_m, lai_k, nodata
-    )
-    from lynceus.nodes.lidar.analysis.grid_vegetation import _veg_polygons
+    budget = ctx.get("_raster_grid_memory_budget_bytes")
+    if tables_fit([str(p) for p in files], 4.0, budget):
+        frames = []
+        for path in files:
+            frame = gpd.read_file(path)
+            if frame is not None and len(frame) > 0:
+                frames.append(frame)
+        if not frames:
+            raise RuntimeError("Segment tables are empty; nothing to consolidate")
+        gids, cols, rows, hists, n = merge_vegetation_frames(frames)
+        finals = finalize_vegetation_frame(
+            gids, cols, rows, hists, n, res, threshold_m, lai_k, nodata
+        )
+        gdf = gpd.GeoDataFrame(
+            finals, geometry=_veg_polygons(cols, rows, res), crs=frames[0].crs
+        )
+        return _write_vegetation_product(
+            ctx, gdf, res, threshold_m, lai_k, nodata)
 
-    gdf = gpd.GeoDataFrame(
-        finals, geometry=_veg_polygons(cols, rows, res), crs=frames[0].crs
+    # Streaming merge: same histogram sums, same finals per batch.
+    note_streamed(ctx, "grid_vegetation.gpkg")
+    from lynceus.nodes.flow._consolidate_base import _peek_feature
+
+    peek = None
+    for path in files:
+        peek = _peek_feature(str(path))
+        if peek is not None:
+            break
+    if peek is None:
+        raise RuntimeError("Segment tables are empty; nothing to consolidate")
+    crs = peek.crs
+    stream = merge_vegetation_stream([str(p) for p in files])
+    first = next(stream, None)
+    if first is None:
+        raise RuntimeError("Segment tables are empty; nothing to consolidate")
+    out = _out_path(ctx, "grid_vegetation.gpkg")
+    csv_path = str(out.with_suffix(".csv"))
+    initialized = False
+    batch = first
+    while True:
+        gids, cols, rows, hists, n = batch
+        finals = finalize_vegetation_frame(
+            gids, cols, rows, hists, n, res, threshold_m, lai_k, nodata
+        )
+        gdf = gpd.GeoDataFrame(
+            finals, geometry=_veg_polygons(cols, rows, res), crs=crs)
+        if not initialized:
+            init_gpkg(out, gdf)
+            gdf.drop(columns=["geometry"]).to_csv(csv_path, index=False)
+            initialized = True
+        else:
+            gdf.drop(columns=["geometry"]).to_csv(
+                csv_path, mode="a", header=False, index=False)
+        append_gpkg(out, gdf)
+        batch = next(stream, None)
+        if batch is None:
+            break
+    from lynceus.processing import provenance
+
+    prov_doc = _consolidate_doc(ctx, "grid_vegetation.gpkg")
+    provenance.embed_gpkg_metadata(str(out), prov_doc)
+    provenance.write_sidecar(
+        str(out), prov_doc, _segment_node_meta(ctx, "grid_vegetation")
     )
+    payload = _consolidate_payload(out, ctx)
+    payload["display_name"] = "Grid Vegetation"
+    payload["csv"] = csv_path
+    return payload
+
+
+def _write_vegetation_product(ctx, gdf, res, threshold_m, lai_k, nodata):
+    """Shared product tail: GPKG + CSV twin + provenance + payload."""
+    from lynceus.nodes.flow._consolidate_base import (
+        _consolidate_doc,
+        _consolidate_payload,
+        _out_path,
+        _segment_node_meta,
+    )
+
     out = _out_path(ctx, "grid_vegetation.gpkg")
     gdf.to_file(str(out), driver="GPKG")
     csv_path = str(out.with_suffix(".csv"))

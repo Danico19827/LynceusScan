@@ -12,25 +12,35 @@ responsible for removing overlap from final products.
 
 import hashlib
 import math
+import os
 import sys
+from pathlib import Path
 
 import laspy
 import numpy as np
 from OpenGL.GL import (
     GL_COLOR_BUFFER_BIT,
     GL_DEPTH_BUFFER_BIT,
+    GL_DEPTH_TEST,
     GL_FLOAT,
+    GL_LEQUAL,
     GL_LINES,
     GL_POINTS,
+    GL_RENDERER,
+    GL_VENDOR,
     glClear,
     glClearColor,
+    glDepthFunc,
     glDrawArrays,
+    glEnable,
+    glGetError,
+    glGetString,
     glPointSize,
     glUniform1f,
 )
 
 from PySide6.QtCore import QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import QMatrix4x4, QSurfaceFormat, QVector3D
+from PySide6.QtGui import QColor, QMatrix4x4, QPixmap, QSurfaceFormat, QVector3D
 from PySide6.QtOpenGL import (
     QOpenGLBuffer,
     QOpenGLShader,
@@ -38,7 +48,14 @@ from PySide6.QtOpenGL import (
     QOpenGLVertexArrayObject,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QSlider, QWidget
+from PySide6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
 
 from lynceus.plugins.locale import t
 from lynceus.ui.viewers.base import BaseViewer, viewer_title
@@ -50,9 +67,62 @@ from lynceus.ui.viewers.registry import register
 # ---------------------------------------------------------------------------
 DISPLAY_POINT_BUDGET = 1_500_000
 MIN_DISPLAY_POINT_BUDGET = 750_000
-MAX_DISPLAY_POINT_BUDGET = 12_000_000
+MAX_DISPLAY_POINT_BUDGET = 100_000_000
 POINT_MEMORY_ESTIMATE = 88  # retained arrays, upload preparation, and VBO allowance
 VIEWER_CHUNK = 1_000_000
+
+def legend_entries(classes: np.ndarray | None) -> list[tuple[int, str, tuple]]:
+    """Legend rows for the ASPRS classes present: ``(code, name, rgb)``.
+
+    Pure helper (unit-tested): unknown codes fall back to ``Class {n}``
+    grey so future LAS classes never break the legend.
+    """
+    if classes is None:
+        return []
+    rows = []
+    for code in sorted({int(c) for c in np.unique(classes)}):
+        if 0 <= code < len(CLASS_NAMES):
+            name = CLASS_NAMES[code]
+        else:
+            name = f"Class {code}"
+        if 0 <= code < len(CLASS_COLORS):
+            rgb = tuple(float(v) for v in CLASS_COLORS[code])
+        else:
+            rgb = (0.65, 0.65, 0.65)
+        rows.append((code, name, rgb))
+    return rows
+
+
+def _legend_position(view_w: int, view_h: int, legend_w: int,
+                     legend_h: int, margin: int = 8):
+    """Top-right corner for the floating legend (pure helper, tested)."""
+    from PySide6.QtCore import QPoint
+
+    return QPoint(max(0, view_w - legend_w - margin), margin)
+
+
+# ASPRS LAS class names for the classification legend (catalog keys).
+CLASS_NAMES = (
+    "Created",             # 0 never classified
+    "Unclassified",        # 1
+    "Ground",              # 2
+    "Low vegetation",      # 3
+    "Medium vegetation",   # 4
+    "High vegetation",     # 5
+    "Building",            # 6
+    "Low point",           # 7 noise
+    "Model key-point",     # 8
+    "Water",               # 9
+    "Rail",                # 10
+    "Road surface",        # 11
+    "Overlap",             # 12
+    "Wire guard",          # 13
+    "Wire conductor",      # 14
+    "Transmission tower",  # 15
+    "Wire connector",      # 16
+    "Bridge deck",         # 17
+    "High noise",          # 18
+)
 
 BACKGROUND = (0.043, 0.059, 0.102)  # #0b0f1a
 SINGLE_COLOR = (0.49, 0.62, 0.83)  # #7d9fd4
@@ -97,6 +167,192 @@ def classification_colors(classes: np.ndarray) -> np.ndarray:
     return colors
 
 
+INTEGRATED_AUTO_POINT_CAP = 6_000_000
+
+_detected_gpu_class: str | None = None
+
+
+def classify_gpu(vendor: str, renderer: str) -> str:
+    """Bucket a GL renderer: discrete/integrated/software/unknown.
+
+    Heuristic from the renderer string (documented approximation, unit
+    tested): unknown renderers are never punished (treated as discrete).
+    """
+    text = f"{vendor or ''} {renderer or ''}".lower()
+    if any(mark in text for mark in (
+            "llvmpipe", "swiftshader", "softpipe", "software")):
+        return "software"
+    if "arc" in text:
+        return "discrete"  # Intel Arc dGPUs report an Intel vendor
+    if any(mark in text for mark in (
+            "intel", "mali", "adreno", "videocore", "apple",
+            "radeon graphics", " vega", "vega ")):
+        return "integrated"
+    if any(mark in text for mark in ("nvidia", "geforce", "quadro",
+                                     "radeon rx", "radeon pro", "tesla")):
+        return "discrete"
+    return "unknown"
+
+
+def note_gpu_renderer(vendor, renderer) -> None:
+    """Cache the machine GPU class from a live GL context (first wins)."""
+    global _detected_gpu_class
+    if _detected_gpu_class is not None:
+        return
+    try:
+        def text(value) -> str:
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            return str(value or "")
+        _detected_gpu_class = classify_gpu(text(vendor), text(renderer))
+    except Exception:
+        pass
+
+
+def _auto_point_budget(available_bytes: int, gpu_class: str | None) -> int:
+    """Auto point budget: 10% of available RAM, GPU-aware (pure)."""
+    try:
+        adaptive = int(int(available_bytes) * 0.10 / POINT_MEMORY_ESTIMATE)
+    except (TypeError, ValueError, OverflowError):
+        return DISPLAY_POINT_BUDGET
+    if gpu_class in ("integrated", "software"):
+        adaptive = min(adaptive, INTEGRATED_AUTO_POINT_CAP)
+    return max(MIN_DISPLAY_POINT_BUDGET,
+               min(MAX_DISPLAY_POINT_BUDGET, adaptive))
+
+
+PREVIEW_CACHE_VERSION = 1
+PREVIEW_CACHE_KEEP = 5
+
+
+def preview_cache_dir(root=None) -> Path:
+    """Local (non-roaming) dir for decimated preview clouds."""
+    from lynceus.plugins.store import local_data_root
+
+    override = root if root is not None else os.environ.get(
+        "LYNCEUS_PREVIEW_CACHE_DIR")
+    base = Path(override) if override else local_data_root()
+    return base / "previews"
+
+
+def preview_fingerprint(path: str) -> str | None:
+    """Short identity of a source file (path, size, mtime)."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    raw = f"{path}|{info.st_size}|{info.st_mtime_ns}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def preview_cache_name(fingerprint: str, budget: int) -> str:
+    return f"preview_{fingerprint}_{int(budget)}.npz"
+
+
+def _prune_preview_cache(directory: Path, keep: int = PREVIEW_CACHE_KEEP,
+                         fingerprint: str | None = None) -> None:
+    """Keep the newest entries (optionally only one file's lineage)."""
+    try:
+        entries = sorted(directory.glob("preview_*.npz"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    if fingerprint is not None:
+        entries = [p for p in entries if f"_{fingerprint}_" not in p.name]
+    for stale in entries[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def save_preview_cache(directory: Path, fingerprint: str, budget: int,
+                       positions: np.ndarray, rgb: np.ndarray | None,
+                       classes: np.ndarray | None,
+                       origin: np.ndarray) -> Path | None:
+    """Persist a loader-result preview (atomic tmp+rename, then prune)."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / preview_cache_name(fingerprint, budget)
+        tmp = target.with_suffix(".tmp")
+        payload = {
+            "positions": np.ascontiguousarray(positions, dtype=np.float32),
+            "origin": np.ascontiguousarray(origin, dtype=np.float64),
+            "budget": np.array([int(budget),
+                                1 if rgb is not None else 0,
+                                1 if classes is not None else 0],
+                               dtype=np.int64),
+        }
+        if rgb is not None:
+            payload["rgb"] = np.ascontiguousarray(rgb, dtype=np.float32)
+        if classes is not None:
+            payload["classes"] = np.ascontiguousarray(classes, dtype=np.uint8)
+        with open(tmp, "wb") as handle:
+            np.savez(handle, **payload)
+        os.replace(tmp, target)
+        _prune_preview_cache(directory)
+        return target
+    except (OSError, ValueError):
+        return None
+
+
+def load_preview_cache(path: Path) -> tuple | None:
+    """Read a cached preview; None when missing or unreadable."""
+    try:
+        with np.load(path, allow_pickle=False) as stored:
+            positions = np.asarray(stored["positions"], dtype=np.float32)
+            origin = np.asarray(stored["origin"], dtype=np.float64)
+            budget, has_rgb, has_classes = (
+                int(v) for v in stored["budget"])
+            rgb = (np.asarray(stored["rgb"], dtype=np.float32)
+                   if has_rgb and "rgb" in stored else None)
+            classes = (np.asarray(stored["classes"], dtype=np.uint8)
+                       if has_classes and "classes" in stored else None)
+    except (OSError, ValueError, KeyError):
+        return None
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        return None
+    count = positions.shape[0]
+    if ((rgb is not None and rgb.shape[0] != count)
+            or (classes is not None and classes.shape[0] != count)):
+        return None
+    return positions, rgb, classes, origin, int(budget)
+
+
+def find_cached_preview(directory: Path, fingerprint: str,
+                        budget: int) -> tuple[Path, int] | None:
+    """Smallest cached budget of this file covering the request."""
+    try:
+        options = []
+        for path in directory.glob(f"preview_{fingerprint}_*.npz"):
+            try:
+                stored = int(path.stem.rsplit("_", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if stored >= budget:
+                options.append((stored, path))
+    except OSError:
+        return None
+    if not options:
+        return None
+    options.sort()
+    return options[0][1], options[0][0]
+
+
+def reservoir_downsample(positions: np.ndarray, rgb: np.ndarray | None,
+                         classes: np.ndarray | None, cap: int,
+                         seed: int) -> tuple:
+    """Uniform subsample of resident arrays (deterministic by seed)."""
+    count = positions.shape[0]
+    if count <= cap or cap <= 0:
+        return positions, rgb, classes
+    scores = np.random.default_rng(seed).random(count)
+    pick = np.argpartition(scores, cap - 1)[:cap]
+    return (positions[pick],
+            rgb[pick] if rgb is not None else None,
+            classes[pick] if classes is not None else None)
+
+
 def _settings_point_budget() -> int | None:
     """Preferences point budget (explicit preset) or None for auto."""
     try:
@@ -138,8 +394,7 @@ def safe_display_point_budget() -> int:
                 min(MAX_DISPLAY_POINT_BUDGET, int(override)),
             )
         available = int(psutil.virtual_memory().available)
-        adaptive = int((available * 0.10) / POINT_MEMORY_ESTIMATE)
-        return max(MIN_DISPLAY_POINT_BUDGET, min(MAX_DISPLAY_POINT_BUDGET, adaptive))
+        return _auto_point_budget(available, _detected_gpu_class)
     except (ImportError, TypeError, ValueError, OSError):
         return DISPLAY_POINT_BUDGET
 
@@ -230,8 +485,23 @@ void main() {
 
 
 class _PointCloudLoader:
-    def __init__(self, tiles: list[dict]):
+    def __init__(self, tiles: list[dict], on_progress=None):
         self._tiles = tiles
+        self._on_progress = on_progress
+        self._progress_done = 0
+        self._progress_total = 0
+
+    def _account(self, count: int) -> None:
+        """Determinate progress: decoded points vs header total."""
+        callback = self._on_progress
+        if callback is None or self._progress_total <= 0:
+            return
+        self._progress_done += max(0, int(count))
+        try:
+            callback(min(self._progress_done, self._progress_total),
+                     self._progress_total)
+        except Exception:
+            pass
 
     def run(self, cancelled):
         try:
@@ -242,6 +512,7 @@ class _PointCloudLoader:
                 for tile in self._tiles
             ]
             bounds = []
+            totals = []
             for tile in normalized_tiles:
                 if cancelled.is_set():
                     return None
@@ -255,12 +526,20 @@ class _PointCloudLoader:
                             np.asarray(reader.header.maxs, dtype=np.float64),
                         )
                     )
+                    totals.append(
+                        int(getattr(reader.header, "point_count", 0) or 0))
             if not bounds:
                 return None
+            self._progress_total = sum(totals)
+            self._progress_done = 0
             origin = (
                 np.min([item[0] for item in bounds], axis=0)
                 + np.max([item[1] for item in bounds], axis=0)
             ) / 2.0
+            cached = self._try_preview_cache(
+                normalized_tiles, point_budget, origin, cancelled)
+            if cached is not None:
+                return cached
 
             pos_parts: list[np.ndarray] = []
             rgb_parts: list[np.ndarray | None] = []
@@ -311,13 +590,83 @@ class _PointCloudLoader:
                 if has_classes
                 else None
             )
-            display_order = np.arange(positions.shape[0], dtype=np.int32)
-            np.random.default_rng(0).shuffle(display_order)
-            return positions, rgb, classes, display_order
+            self._save_preview_cache(
+                normalized_tiles, point_budget, origin, cancelled,
+                positions, rgb, classes)
+            return positions, rgb, classes, None
         except MemoryError as exc:
             raise RuntimeError("Not enough memory to load the point cloud") from exc
         except Exception as exc:
             raise RuntimeError(f"Error loading point cloud: {exc}") from exc
+
+    @staticmethod
+    def _cacheable_single_file(tiles) -> str | None:
+        """Source path when the payload is one plain file (else None)."""
+        if len(tiles) != 1:
+            return None
+        tile = tiles[0]
+        if not isinstance(tile, dict):
+            return None
+        if tile.get("crop_core", False):
+            return None
+        path = tile.get("file")
+        return path if path else None
+
+    def _try_preview_cache(self, tiles, budget: int, origin,
+                           cancelled):
+        """Instant uniform sample: exact hit, or downsample of a larger one.
+
+        Misses (and multi-file payloads) fall through to the full decode;
+        the winner is persisted afterwards by ``_save_preview_cache``.
+        """
+        path = self._cacheable_single_file(tiles)
+        if path is None or cancelled.is_set():
+            return None
+        fingerprint = preview_fingerprint(path)
+        if fingerprint is None:
+            return None
+        try:
+            directory = preview_cache_dir()
+        except Exception:
+            return None
+        found = find_cached_preview(directory, fingerprint, budget)
+        if found is None:
+            return None
+        cached_path, stored_budget = found
+        stored = load_preview_cache(cached_path)
+        if stored is None:
+            return None
+        positions, rgb, classes, _origin, _stored = stored
+        if positions.shape[0] > budget:
+            seed = int.from_bytes(
+                bytes.fromhex(fingerprint), "little") % (2 ** 31)
+            positions, rgb, classes = reservoir_downsample(
+                positions, rgb, classes, budget, seed)
+        self._progress_done = self._progress_total
+        if self._on_progress is not None and self._progress_total > 0:
+            try:
+                self._on_progress(self._progress_total, self._progress_total)
+            except Exception:
+                pass
+        return positions, rgb, classes, None
+
+    def _save_preview_cache(self, tiles, budget: int, origin,
+                            cancelled, positions, rgb, classes) -> None:
+        """Persist this uniform sample for instant future loads."""
+        if cancelled.is_set():
+            return
+        path = self._cacheable_single_file(tiles)
+        if path is None:
+            return
+        fingerprint = preview_fingerprint(path)
+        if fingerprint is None:
+            return
+        try:
+            directory = preview_cache_dir()
+        except Exception:
+            return
+        save_preview_cache(directory, fingerprint, budget, positions, rgb,
+                           classes, origin)
 
     def _load_tile(
         self, tile: dict, tile_cap: int, origin: np.ndarray, cancelled
@@ -329,8 +678,10 @@ class _PointCloudLoader:
             key in tile
             for key in ("core_x_min", "core_y_min", "core_x_max", "core_y_max")
         )
-        with laspy.open(path) as metadata_reader:
-            header = metadata_reader.header
+        with laspy.open(
+            path, laz_backend=laspy.LazBackend.LazrsParallel
+        ) as reader:
+            header = reader.header
             dimensions = set(header.point_format.dimension_names)
             has_rgb = {"red", "green", "blue"}.issubset(dimensions)
             has_classes = "classification" in dimensions
@@ -341,7 +692,23 @@ class _PointCloudLoader:
                 and getattr(vlr, "record_id", None) == 1
                 for vlr in (*(header.vlrs or ()), *(header.evlrs or ()))
             )
+            total = int(getattr(header, "point_count", 0) or 0)
+            if is_copc:
+                return self._load_copc_tile(
+                    tile, tile_cap, origin, cancelled, header, file_mins,
+                    file_maxs, has_rgb, has_classes, has_core,
+                )
+            return self._load_plain_tile(
+                reader, tile, tile_cap, total, origin, cancelled,
+                has_rgb, has_classes, has_core,
+            )
 
+    def _load_copc_tile(
+        self, tile, tile_cap, origin, cancelled, header, file_mins,
+        file_maxs, has_rgb, has_classes, has_core,
+    ):
+        """COPC resolution query (own reader); falls back to plain scan."""
+        path = tile.get("file")
         seed = int.from_bytes(
             hashlib.sha1(path.encode("utf-8")).digest()[:8], "little"
         )
@@ -355,6 +722,7 @@ class _PointCloudLoader:
             x = np.asarray(points.x)
             y = np.asarray(points.y)
             z = np.asarray(points.z)
+            self._account(int(x.size))
             if has_core:
                 mask = (
                     (x >= tile["core_x_min"])
@@ -365,7 +733,6 @@ class _PointCloudLoader:
                 x, y, z = x[mask], y[mask], z[mask]
             if not x.size:
                 return
-
             positions = _localize_coordinates(x, y, z, origin)
             rgb = None
             if has_rgb:
@@ -394,54 +761,150 @@ class _PointCloudLoader:
             )
 
         queried = False
-        if is_copc:
-            try:
-                from laspy import copc
+        try:
+            from laspy import copc
 
-                query_mins = file_mins.copy()
-                query_maxs = file_maxs.copy()
-                if has_core:
-                    query_mins[:2] = (tile["core_x_min"], tile["core_y_min"])
-                    query_maxs[:2] = (tile["core_x_max"], tile["core_y_max"])
-                extent = np.maximum(query_maxs - query_mins, 1e-6)
-                resolution = max(
-                    float(np.cbrt(np.prod(extent) / tile_cap)), 1e-3
-                )
-                copc_reader = getattr(copc, "CopcReader", None)
-                open_reader = getattr(copc_reader, "open", None)
-                bounds_type = getattr(copc, "Bounds", None)
-                if callable(open_reader) and bounds_type is not None:
-                    with open_reader(path) as reader:
-                        query = getattr(reader, "query", None)
-                        if callable(query):
-                            points = query(
-                                bounds=bounds_type(query_mins, query_maxs),
-                                resolution=resolution,
-                            )
-                            consume(points)
-                            queried = True
-            except MemoryError:
-                raise
-            except Exception:
-                queried = False
+            query_mins = file_mins.copy()
+            query_maxs = file_maxs.copy()
+            if has_core:
+                query_mins[:2] = (tile["core_x_min"], tile["core_y_min"])
+                query_maxs[:2] = (tile["core_x_max"], tile["core_y_max"])
+            extent = np.maximum(query_maxs - query_mins, 1e-6)
+            resolution = max(
+                float(np.cbrt(np.prod(extent) / tile_cap)), 1e-3
+            )
+            copc_reader = getattr(copc, "CopcReader", None)
+            open_reader = getattr(copc_reader, "open", None)
+            bounds_type = getattr(copc, "Bounds", None)
+            if callable(open_reader) and bounds_type is not None:
+                with open_reader(path) as copc_reader:
+                    query = getattr(copc_reader, "query", None)
+                    if callable(query):
+                        points = query(
+                            bounds=bounds_type(query_mins, query_maxs),
+                            resolution=resolution,
+                        )
+                        consume(points)
+                        queried = True
+        except MemoryError:
+            raise
+        except Exception:
+            queried = False
 
         if not queried:
-            with laspy.open(path) as reader:
-                for chunk in reader.chunk_iterator(VIEWER_CHUNK):
-                    if cancelled.is_set():
-                        return None, None, None, has_rgb, has_classes
-                    consume(chunk)
-
+            with laspy.open(
+                path, laz_backend=laspy.LazBackend.LazrsParallel
+            ) as reader:
+                total = int(getattr(reader.header, "point_count", 0) or 0)
+                self._consume_chunks(
+                    reader, tile, tile_cap, total,
+                    origin, cancelled, has_rgb, has_classes, has_core,
+                    consume,
+                )
         if sample is None:
             return None, None, None, has_rgb, has_classes
         _, positions, rgb, classes = sample
-        return (
-            positions,
-            rgb,
-            classes,
-            has_rgb,
-            has_classes,
+        return positions, rgb, classes, has_rgb, has_classes
+
+    def _load_plain_tile(
+        self, reader, tile, tile_cap, total, origin, cancelled,
+        has_rgb, has_classes, has_core,
+    ):
+        """Single-open chunk scan with a uniform reservoir past the cap."""
+        seed = int.from_bytes(
+            hashlib.sha1(tile.get("file", "").encode("utf-8")).digest()[:8],
+            "little",
         )
+        rng = np.random.default_rng(seed)
+        sample = None
+        # Fast path: the header count fits the cap, so every point is kept
+        # and the reservoir (scores + repeated argpartition/concatenates,
+        # quadratic over chunks) is pure overhead.
+        exact = 0 < total <= tile_cap
+        pos_list: list[np.ndarray] = []
+        rgb_list: list[np.ndarray] = []
+        cls_list: list[np.ndarray] = []
+
+        def consume(points) -> None:
+            nonlocal sample
+            if cancelled.is_set():
+                return
+            x = np.asarray(points.x)
+            y = np.asarray(points.y)
+            z = np.asarray(points.z)
+            self._account(int(x.size))
+            if has_core:
+                mask = (
+                    (x >= tile["core_x_min"])
+                    & (x < tile["core_x_max"])
+                    & (y >= tile["core_y_min"])
+                    & (y < tile["core_y_max"])
+                )
+                x, y, z = x[mask], y[mask], z[mask]
+            if not x.size:
+                return
+            positions = _localize_coordinates(x, y, z, origin)
+            rgb = None
+            if has_rgb:
+                channels = [
+                    np.asarray(getattr(points, channel), dtype=np.float32)
+                    for channel in ("red", "green", "blue")
+                ]
+                if has_core:
+                    channels = [channel[mask] for channel in channels]
+                scale = (
+                    255.0
+                    if max(float(channel.max()) for channel in channels) <= 255
+                    else 65535.0
+                )
+                rgb = np.column_stack(channels).astype(np.float32, copy=False) / scale
+            classes = (
+                np.asarray(points.classification, dtype=np.uint8)
+                if has_classes
+                else None
+            )
+            if has_core and classes is not None:
+                classes = classes[mask]
+            if exact:
+                pos_list.append(positions)
+                if rgb is not None:
+                    rgb_list.append(rgb)
+                if classes is not None:
+                    cls_list.append(classes)
+                return
+            scores = rng.random(positions.shape[0])
+            sample = _bounded_sample_merge(
+                sample, scores, positions, rgb, classes, tile_cap
+            )
+
+        self._consume_chunks(
+            reader, tile, tile_cap, total, origin, cancelled, has_rgb,
+            has_classes, has_core, consume,
+        )
+        if exact:
+            if not pos_list:
+                return None, None, None, has_rgb, has_classes
+            return (
+                np.concatenate(pos_list),
+                np.concatenate(rgb_list) if has_rgb else None,
+                np.concatenate(cls_list) if has_classes else None,
+                has_rgb,
+                has_classes,
+            )
+        if sample is None:
+            return None, None, None, has_rgb, has_classes
+        _, positions, rgb, classes = sample
+        return positions, rgb, classes, has_rgb, has_classes
+
+    @staticmethod
+    def _consume_chunks(reader, tile, tile_cap, total, origin, cancelled,
+                        has_rgb, has_classes, has_core, consume) -> None:
+        """Plain sequential scan (single open, shared by all paths)."""
+        for chunk in reader.chunk_iterator(VIEWER_CHUNK):
+            if cancelled.is_set():
+                return
+            consume(chunk)
+
 # ---------------------------------------------------------------------------
 # OpenGL view
 # ---------------------------------------------------------------------------
@@ -451,22 +914,52 @@ def _interleaved_points(
     classes: np.ndarray | None,
     color_mode: str,
 ) -> np.ndarray:
+    """Pack positions + colors for one VBO upload (single allocation).
+
+    Every color source is float32, so filling the halves in place is
+    value-identical to the old hstack-then-astype while skipping a full
+    extra buffer and pass (2.4 GB at 100M points).
+    """
     count = positions.shape[0]
+    out = np.empty((count, 6), dtype=np.float32)
+    out[:, :3] = positions
     if color_mode == "rgb" and rgb is not None:
-        colors = rgb
+        out[:, 3:] = rgb
     elif color_mode == "classification" and classes is not None:
-        colors = classification_colors(classes)
+        out[:, 3:] = classification_colors(classes)
     elif color_mode == "elevation":
-        colors = elevation_colors(positions[:, 2])
+        out[:, 3:] = elevation_colors(positions[:, 2])
     else:
-        colors = np.tile(np.array(SINGLE_COLOR, dtype=np.float32), (count, 1))
-    return np.hstack([positions, colors]).astype(np.float32, copy=False)
+        out[:, 3:] = np.asarray(SINGLE_COLOR, dtype=np.float32)
+    return out
+
+
+def _shuffled_order(count: int) -> np.ndarray:
+    """Deterministic draw order for density subsampling (built lazily).
+
+    The eager arange+shuffle cost ~400 MB + seconds at 100M points, yet
+    density 100 (the default) never reads it.
+    """
+    order = np.arange(count, dtype=np.int32)
+    np.random.default_rng(0).shuffle(order)
+    return order
 
 
 class _GLView(QOpenGLWidget):
     upload_requested = Signal()
     points_uploaded = Signal(int)
+    upload_failed = Signal(str)
+    # Floats, not ints: byte counts past 2 GiB overflow shiboken's C int
+    # conversion at emit time (exact up to 2**53, plenty for buffers).
+    upload_progress = Signal(float, float)
+    render_failed = Signal(str)
     upload_chunk_bytes = 4 * 1024 * 1024
+    # One QOpenGLBuffer.allocate() takes a C int: anything past 2 GiB
+    # raises OverflowError in the binding, and several integrated drivers
+    # further cap single allocations around 256-512 MB. Point data is
+    # striped over several buffers of at most this many points
+    # (10M x 24 B = 240 MB), so dense clouds upload anywhere.
+    vbo_split_points = 10_000_000
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -498,12 +991,11 @@ class _GLView(QOpenGLWidget):
         self._point_size = 3.0
         self._display_order: np.ndarray | None = None
         self._display_count = 0
-        self._pending_points: np.ndarray | None = None
-        self._pending_points_offset = 0
-        self._pending_points_count = 0
         self._upload_timer = QTimer(self)
         self._upload_timer.setInterval(1)
         self._upload_timer.timeout.connect(self._upload_next_points_chunk)
+        self._upload_total_bytes = 0
+        self._upload_done_bytes = 0
 
         # GL resources
         self._points_program: QOpenGLShaderProgram | None = None
@@ -511,9 +1003,23 @@ class _GLView(QOpenGLWidget):
         self._loc_mvp_p = -1
         self._loc_size_p = -1
         self._loc_mvp_l = -1
-        self._points_vbo: QOpenGLBuffer | None = None
         self._lines_vbo: QOpenGLBuffer | None = None
         self._vao: QOpenGLVertexArrayObject | None = None
+        # Displayed point stripes: [(buffer, row count)], each buffer
+        # under 2 GiB (see vbo_split_points). In-flight upload pieces live
+        # in _upload_*; retired buffers wait here for a current context.
+        self._points_vbos: list = []
+        self._upload_pieces: list[np.ndarray] = []
+        self._upload_piece = 0
+        self._upload_written = 0
+        self._upload_vbo: QOpenGLBuffer | None = None
+        self._staged_vbos: list = []
+        self._retired_vbos: list[QOpenGLBuffer] = []
+        self._upload_count = 0
+        # First render/upload failure latches here: paintGL returns early
+        # afterwards instead of raising once per frame (PySide aborts on
+        # repeated exceptions inside paint/event overrides).
+        self._render_broken: str | None = None
         self._points_count = 0
         self._lines_count = 0
 
@@ -537,9 +1043,7 @@ class _GLView(QOpenGLWidget):
         self._source_rgb = rgb
         self._source_classes = classes
         self._density = 100
-        self._display_order = display_order if display_order is not None else np.arange(
-            positions.shape[0], dtype=np.int32
-        )
+        self._display_order = display_order
         if color_mode is not None:
             self._color_mode = color_mode
         self._refresh_display(reset_view=True)
@@ -571,7 +1075,7 @@ class _GLView(QOpenGLWidget):
         self._classes = self._source_classes
         if reset_view:
             self._fit_to_data()
-        if self._points_vbo is not None:
+        if self._points_program is not None:
             self.upload_requested.emit()
             if reset_view:
                 self._upload_axes()
@@ -595,6 +1099,12 @@ class _GLView(QOpenGLWidget):
         self._vao.create()
         self._vao.bind()
 
+        # Nearest-point-wins: without the depth test the paint order decides
+        # (the reference grid landed on top of the cloud and read as seams,
+        # and far points overwrote near ones).
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
+
         self._points_program = self._make_program(POINT_VERTEX)
         self._lines_program = self._make_program(LINE_VERTEX)
 
@@ -602,15 +1112,53 @@ class _GLView(QOpenGLWidget):
         self._loc_mvp_p = self._points_program.uniformLocation("uMVP")
         self._loc_size_p = self._points_program.uniformLocation("uPointSize")
         self._loc_mvp_l = self._lines_program.uniformLocation("uMVP")
+        self._check_programs()
+        try:
+            note_gpu_renderer(glGetString(GL_VENDOR),
+                              glGetString(GL_RENDERER))
+        except Exception:
+            pass
 
-        self._points_vbo = QOpenGLBuffer(QOpenGLBuffer.Type.VertexBuffer)
-        self._points_vbo.create()
         self._lines_vbo = QOpenGLBuffer(QOpenGLBuffer.Type.VertexBuffer)
         self._lines_vbo.create()
 
+        # A recreated context invalidates every buffer handle: drop them
+        # (numpy pieces survive, so a pending upload simply restarts).
+        self._points_vbos = []
+        self._upload_vbo = None
+        self._staged_vbos = []
+        self._retired_vbos = []
+        self._points_count = 0
+        if self._upload_pieces:
+            self._upload_piece = 0
+            self._upload_written = 0
+
         self._upload_axes()
-        if self._pending_points is not None:
+        if self._upload_pieces:
             self._upload_timer.start()
+
+    def _check_programs(self) -> None:
+        """Fail loud once when the driver rejects our shaders.
+
+        A dead program yields attribute location -1, and every later
+        setAttributeBuffer then poisons the GL error flag — surfacing as
+        an inscrutable error at the next checked call, once per frame.
+        """
+        problems = []
+        for program in (self._points_program, self._lines_program):
+            if program is None or not program.isLinked():
+                problems.append(
+                    str(program.log()) if program is not None else "null"
+                )
+                continue
+            for name in ("aPos", "aColor"):
+                if program.attributeLocation(name) < 0:
+                    problems.append(f"missing attribute {name}")
+        if problems:
+            self._fail_render_once(
+                "GPU shaders rejected by the driver: "
+                + " / ".join(problems)
+            )
 
     def _make_program(self, vertex: str) -> QOpenGLShaderProgram:
         program = QOpenGLShaderProgram(self)
@@ -626,60 +1174,141 @@ class _GLView(QOpenGLWidget):
             print("GL LINK ERROR:", program.log(), file=sys.stderr)
         return program
 
+    @staticmethod
+    def _split_pieces(data: np.ndarray, max_points: int) -> list[np.ndarray]:
+        """Row views over point data, each under the VBO byte ceiling."""
+        total = data.shape[0]
+        step = max(1, int(max_points))
+        return [data[start:start + step] for start in range(0, total, step)]
+
     def queue_points_upload(self, data: np.ndarray, point_count: int) -> None:
-        self._pending_points = data
-        self._pending_points_offset = 0
-        self._pending_points_count = point_count
+        self._retire_point_buffers()
+        self._upload_pieces = self._split_pieces(data, self.vbo_split_points)
+        self._upload_piece = 0
+        self._upload_written = 0
+        self._upload_vbo = None
+        self._staged_vbos = []
+        self._upload_count = point_count
+        self._upload_total_bytes = int(data.nbytes)
+        self._upload_done_bytes = 0
         self._points_count = 0
-        if self._points_vbo is not None and self.isValid():
+        if self.isValid():
             self._upload_timer.start()
         self.update()
 
     def cancel_pending_points_upload(self) -> None:
-        self._pending_points = None
-        self._pending_points_offset = 0
+        self._upload_pieces = []
+        self._upload_piece = 0
+        self._upload_written = 0
+        self._upload_done_bytes = 0
+        self._upload_vbo = None
+        self._staged_vbos = []
         self._points_count = 0
 
+    def _retire_point_buffers(self) -> None:
+        """Park displayed/in-flight buffers for destruction on a live context.
+
+        queue() runs on the GUI thread without a current context, so GL
+        handles are only destroyed inside the upload tick (or initializeGL).
+        """
+        self._retired_vbos.extend(
+            vbo for vbo, _count in self._points_vbos)
+        self._points_vbos = []
+        if self._upload_vbo is not None:
+            self._retired_vbos.append(self._upload_vbo)
+            self._upload_vbo = None
+        for vbo, _count in self._staged_vbos:
+            self._retired_vbos.append(vbo)
+        self._staged_vbos = []
+
+    def _destroy_retired(self) -> None:
+        while self._retired_vbos:
+            vbo = self._retired_vbos.pop()
+            try:
+                vbo.destroy()
+            except Exception:
+                pass
+
     def _upload_pending_points(self) -> bool:
-        data = self._pending_points
-        if data is None or self._points_vbo is None:
-            return data is not None
+        if self._upload_piece >= len(self._upload_pieces):
+            return False
+        data = self._upload_pieces[self._upload_piece]
+        if self._upload_vbo is None:
+            vbo = QOpenGLBuffer(QOpenGLBuffer.Type.VertexBuffer)
+            vbo.create()
+            vbo.bind()
+            # Piece bytes stay under 2 GiB by construction: allocate() and
+            # write() take C ints and overflow past INT_MAX.
+            vbo.allocate(int(data.nbytes))
+            vbo.release()
+            self._upload_vbo = vbo
+            self._upload_written = 0
 
         bytes_per_point = int(data.strides[0])
         points_per_chunk = max(1, self.upload_chunk_bytes // bytes_per_point)
-        start = self._pending_points_offset
+        start = self._upload_written // bytes_per_point
         end = min(data.shape[0], start + points_per_chunk)
         chunk = data[start:end].tobytes()
 
-        self._points_vbo.bind()
-        if start == 0:
-            self._points_vbo.allocate(data.nbytes)
-        self._points_vbo.write(start * bytes_per_point, chunk, len(chunk))
-        self._points_vbo.release()
-        self._pending_points_offset = end
+        vbo = self._upload_vbo
+        assert vbo is not None
+        vbo.bind()
+        vbo.write(int(start * bytes_per_point), chunk, len(chunk))
+        vbo.release()
+        self._upload_written = end * bytes_per_point
 
         if end >= data.shape[0]:
-            self._points_count = self._pending_points_count
-            self._pending_points = None
-            self._pending_points_offset = 0
+            self._staged_vbos.append((vbo, int(data.shape[0])))
+            self._upload_done_bytes += int(data.nbytes)
+            self._upload_vbo = None
+            self._upload_piece += 1
+
+        if self._upload_piece >= len(self._upload_pieces):
+            self._points_vbos = self._staged_vbos
+            self._staged_vbos = []
+            self._upload_pieces = []
+            self._points_count = self._upload_count
             self.points_uploaded.emit(self._points_count)
             return False
 
         return True
 
     def _upload_next_points_chunk(self) -> None:
-        if self._pending_points is None:
+        if not self._upload_pieces:
             self._upload_timer.stop()
             return
-        if self._points_vbo is None or not self.isValid():
+        if not self.isValid():
             return
         self.makeCurrent()
         try:
-            self._upload_pending_points()
+            self._destroy_retired()
+            try:
+                self._upload_pending_points()
+            except Exception as exc:
+                # Fail loud once (stale timer retries spammed the console
+                # with one traceback per tick).
+                self._upload_timer.stop()
+                self._upload_pieces = []
+                self._upload_piece = 0
+                self._upload_written = 0
+                self._upload_vbo = None
+                self._staged_vbos = []
+                self.upload_failed.emit(str(exc))
+            else:
+                if not self._upload_pieces:
+                    # Just finished: points_uploaded is already queued with
+                    # the final count, so no trailing progress emission.
+                    pass
+                else:
+                    done = self._upload_done_bytes + self._upload_written
+                    try:
+                        self.upload_progress.emit(done, self._upload_total_bytes)
+                    except Exception:
+                        pass
         finally:
             self.doneCurrent()
         self.update()
-        if self._pending_points is None:
+        if not self._upload_pieces:
             self._upload_timer.stop()
 
     def _upload_axes(self) -> None:
@@ -709,12 +1338,17 @@ class _GLView(QOpenGLWidget):
             # Vertex colors are assigned when the line buffer is interleaved.
         grid_min = min_pt + (max_pt - min_pt) * 0.15
         grid_max = max_pt - (max_pt - min_pt) * 0.15
+        # Half a metre under the lowest point: with the depth test the grid is
+        # occluded by the cloud anyway, and the drop keeps coplanar points
+        # from z-fighting the floor lines.
+        z_floor = float(min_pt[2]) - max(
+            0.5, 0.02 * float(max_pt[2] - min_pt[2])
+        )
         steps = 6
         for i in range(steps + 1):
             t = i / steps
             x = grid_min[0] + (grid_max[0] - grid_min[0]) * t
             y = grid_min[1] + (grid_max[1] - grid_min[1]) * t
-            z_floor = float(min_pt[2])
             lines.append(
                 np.array(
                     [[x, grid_min[1], z_floor], [x, grid_max[1], z_floor]],
@@ -754,7 +1388,36 @@ class _GLView(QOpenGLWidget):
         program.setAttributeBuffer(color_loc, GL_FLOAT, 12, 3, stride)
         vbo.release()
 
+    def _fail_render_once(self, message: str) -> None:
+        """Latch the first render pathology: one signal, then silence."""
+        if self._render_broken is None:
+            self._render_broken = str(message)
+            try:
+                self.render_failed.emit(self._render_broken)
+            except Exception:
+                pass
+
     def paintGL(self) -> None:
+        if self._render_broken is not None:
+            return
+        try:
+            self._paintGL_guarded()
+        except Exception as exc:
+            self._fail_render_once(f"{exc}")
+
+    def _paintGL_guarded(self) -> None:
+        import time
+
+        started = time.perf_counter()
+        # Drain pre-existing flags: Qt/driver calls outside this frame may
+        # leave a stale error behind, and blaming it on the frame would
+        # latch a healthy viewer on the very first paint.
+        for _ in range(8):
+            try:
+                if not glGetError():
+                    break
+            except Exception:
+                break
         if self._vao is not None:
             self._vao.bind()
         try:
@@ -763,24 +1426,37 @@ class _GLView(QOpenGLWidget):
             mvp = self._mvp()
 
             if (
-                self._points_count
+                self._points_vbos
                 and self._points_program is not None
             ):
                 self._points_program.bind()
                 self._points_program.setUniformValue(self._loc_mvp_p, mvp)
                 glUniform1f(self._loc_size_p, float(self._point_size))
                 glPointSize(float(self._point_size))
-                self._bind_attributes(self._points_program, self._points_vbo)
-                glDrawArrays(GL_POINTS, 0, self._points_count)
+                for vbo, count in self._points_vbos:
+                    if vbo is None or not vbo.isCreated() or count <= 0:
+                        continue
+                    self._bind_attributes(self._points_program, vbo)
+                    glDrawArrays(GL_POINTS, 0, int(count))
 
             if self._lines_count and self._lines_program is not None:
                 self._lines_program.bind()
                 self._lines_program.setUniformValue(self._loc_mvp_l, mvp)
                 self._bind_attributes(self._lines_program, self._lines_vbo)
                 glDrawArrays(GL_LINES, 0, self._lines_count)
+            pending = glGetError()
+            if pending:
+                raise RuntimeError(f"GL error {pending:#x} after frame")
         finally:
             if self._vao is not None:
                 self._vao.release()
+            host = self.parent()
+            sample = getattr(host, "_on_frame_sample", None)
+            if callable(sample):
+                try:
+                    sample((time.perf_counter() - started) * 1000.0)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Camera.
@@ -903,8 +1579,11 @@ class _GLView(QOpenGLWidget):
 class PointCloud3DViewer(BaseViewer):
     """3D point-cloud preview with background loading and orbital navigation."""
 
+    load_progress = Signal(float, float)
+
     def __init__(self, kind: str, parent: QWidget | None = None):
         super().__init__(kind, parent)
+        self.load_progress.connect(self._on_load_progress)
         control_bar = QWidget(self)
         control_bar.setObjectName("pointCloudControls")
         control_bar.setMaximumHeight(32)
@@ -974,6 +1653,7 @@ class PointCloud3DViewer(BaseViewer):
         self._loaded_label = QLabel("-- pts")
         self._loaded_label.setMinimumWidth(72)
         controls.addWidget(self._loaded_label)
+        self.install_help_button(controls)
 
         self._layout.insertWidget(0, control_bar)
         self._gl = _GLView(self)
@@ -981,8 +1661,39 @@ class PointCloud3DViewer(BaseViewer):
         self._gl.points_uploaded.connect(
             self._on_gl_uploaded, Qt.ConnectionType.QueuedConnection
         )
+        self._gl.upload_failed.connect(
+            self._on_gl_upload_failed, Qt.ConnectionType.QueuedConnection
+        )
+        self._gl.upload_progress.connect(
+            self._on_gl_upload_progress, Qt.ConnectionType.QueuedConnection
+        )
+        self._frame_sample_at = 0.0
+        self._gl.render_failed.connect(
+            self._on_gl_render_failed, Qt.ConnectionType.QueuedConnection
+        )
         self._layout.addWidget(self._gl)
         self._gl.hide()
+
+        # Floating classification legend over the viewport (top-right):
+        # an inline bar with up to 19 swatch+label pairs eats half the
+        # viewer, so the legend floats instead and only shows in
+        # classification mode.
+        self._class_legend = QWidget(self._gl)
+        self._class_legend.setObjectName("pointCloudLegend")
+        self._legend_rows = QVBoxLayout(self._class_legend)
+        self._legend_rows.setContentsMargins(6, 6, 6, 6)
+        self._legend_rows.setSpacing(2)
+        self._class_legend.hide()
+        self._legend_key = None
+
+    def help_text(self) -> str | None:
+        return (
+            "<b>Navigate</b><br>Drag: orbit · Wheel: zoom · "
+            "Double-click or F: fit · R: reset view<br><b>Color</b><br>"
+            "C cycles RGB / Classification / Elevation / Single color"
+            "<br><b>Size</b><br>+ / -: point size · Density: share of "
+            "loaded points drawn"
+        )
 
     def set_payload(self, payload) -> None:
         tiles = payload.get("tiles") if isinstance(payload, dict) else None
@@ -991,14 +1702,99 @@ class PointCloud3DViewer(BaseViewer):
         if not tiles:
             self.show_placeholder(t("No data available"))
             self._gl.hide()
+            self._class_legend.hide()
             return
 
         self._gl.hide()
-        loader = _PointCloudLoader(tiles)
+        loader = _PointCloudLoader(tiles, on_progress=self.load_progress.emit)
         self.start_async_load(loader.run, self._on_loaded, self._on_failed)
+
+    def _on_load_progress(self, done: float, total: float) -> None:
+        self._loaded_label.setText(f"{int(done):,} / {int(total):,} pts")
+
+    def _on_gl_upload_progress(self, done: int, total: int) -> None:
+        self._loaded_label.setText(
+            f"↑ {done / 1048576:.0f} / {total / 1048576:.0f} MB")
+
+    def _on_frame_sample(self, ms: float) -> None:
+        import time
+
+        now = time.monotonic()
+        if now - self._frame_sample_at < 0.5:
+            return
+        self._frame_sample_at = now
+        text = self._loaded_label.text()
+        base = text.split(" · ")[0]
+        self._loaded_label.setText(f"{base} · {ms:.0f} ms/f")
 
     def _on_color_changed(self, _index: int) -> None:
         self._gl.set_color_mode(self._color_combo.currentData())
+        self._refresh_class_legend()
+
+    def _refresh_class_legend(self) -> None:
+        """Swatches for the ASPRS classes present (classification mode).
+
+        Rebuilt only when the present-class set or the color mode changes;
+        hidden outside classification mode so RGB/elevation stay clean.
+        """
+        classes = getattr(self._gl, "_source_classes", None)
+        mode = self._color_combo.currentData()
+        entries = legend_entries(classes)
+        key = (mode, tuple(code for code, _name, _rgb in entries))
+        if key == self._legend_key:
+            self._place_legend()
+            self._class_legend.setVisible(
+                bool(entries) and mode == "classification")
+            return
+        self._legend_key = key
+        layout = self._legend_rows
+        while layout.count():
+            child = layout.takeAt(0)
+            row = child.widget()
+            row_layout = child.layout()
+            if row_layout is not None:
+                while row_layout.count():
+                    sub = row_layout.takeAt(0).widget()
+                    if sub is not None:
+                        sub.deleteLater()
+            if row is not None:
+                row.deleteLater()
+        if entries and mode == "classification":
+            for _code, name, rgb in entries:
+                row = QWidget(self._class_legend)
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(4)
+                swatch = QLabel()
+                pixmap = QPixmap(14, 14)
+                pixmap.fill(QColor(int(rgb[0] * 255), int(rgb[1] * 255),
+                                   int(rgb[2] * 255)))
+                swatch.setPixmap(pixmap)
+                swatch.setFixedSize(16, 16)
+                row_layout.addWidget(swatch)
+                label = QLabel(t(name))
+                label.setObjectName("viewerLegendText")
+                row_layout.addWidget(label)
+                layout.addWidget(row)
+            self._class_legend.show()
+            self._place_legend()
+        else:
+            self._class_legend.hide()
+
+    def _place_legend(self) -> None:
+        """Pin the floating legend top-right of the viewport."""
+        legend = self._class_legend
+        if not legend.isVisible():
+            return
+        legend.setFixedSize(legend.sizeHint())
+        legend.move(_legend_position(
+            self._gl.width(), self._gl.height(),
+            legend.width(), legend.height(),
+        ))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_legend()
 
     def _on_density_changed(self, value: int) -> None:
         self._density_label.setText(f"{value}%")
@@ -1025,13 +1821,18 @@ class PointCloud3DViewer(BaseViewer):
         self._color_combo.blockSignals(True)
         self._color_combo.setCurrentIndex(color_index)
         self._color_combo.blockSignals(False)
-        self._placeholder.setText(t("Loading..."))
-        self._placeholder.show()
+        self._placeholder.hide()
         self._progress.show()
+        # The GL viewport shows as soon as data is decoded (never alongside
+        # the placeholder: both expand, and that split the window half/half).
+        # Showing it also creates the GL context, which the upload timer
+        # needs: a hidden QOpenGLWidget never initializes and the points
+        # would wait forever with "Loading..." on screen.
         self._gl.show()
         self._gl.set_point_size(self._size_slider.value())
         self._gl.set_points(positions, rgb, classes, display_order, mode)
         self._loaded_label.setText(f"{self._gl.point_count():,} pts")
+        self._refresh_class_legend()
 
     def _request_gl_upload(self) -> None:
         positions = self._gl._source_positions
@@ -1042,6 +1843,12 @@ class PointCloud3DViewer(BaseViewer):
         order = self._gl._display_order
         color_mode = self._gl.color_mode()
         count = max(1, int(positions.shape[0] * self._gl.density() / 100))
+        if count < positions.shape[0] and (
+            order is None or order.shape[0] != positions.shape[0]
+        ):
+            # Built on first subsampled draw only (density < 100).
+            order = _shuffled_order(positions.shape[0])
+            self._gl._display_order = order
         self._gl.cancel_pending_points_upload()
 
         def prepare(cancelled):
@@ -1069,7 +1876,8 @@ class PointCloud3DViewer(BaseViewer):
             prepare,
             prepared,
             lambda exc: self.show_placeholder(
-                f"Error preparing point-cloud preview: {exc}"
+                t("Error preparing point-cloud preview: {exc}").format(
+                    exc=exc)
             ),
             show_loading=False,
         )
@@ -1077,13 +1885,32 @@ class PointCloud3DViewer(BaseViewer):
     def _on_gl_uploaded(self, point_count: int) -> None:
         self._progress.hide()
         self._placeholder.hide()
+        self._gl.show()
         self._loaded_label.setText(f"{point_count:,} pts")
         self.setWindowTitle(
             f"{viewer_title(self._kind)} ({point_count:,} pts)"
             + (f" — {self._product_title}" if self._product_title else "")
         )
 
+    def _on_gl_upload_failed(self, message: str) -> None:
+        self._progress.hide()
+        self._gl.hide()
+        self._class_legend.hide()
+        self.show_placeholder(
+            t("Error uploading points to the GPU: {exc}").format(exc=message)
+        )
+
+    def _on_gl_render_failed(self, message: str) -> None:
+        self._progress.hide()
+        self._gl.hide()
+        self._class_legend.hide()
+        self.show_placeholder(
+            t("Error rendering points on the GPU: {exc}").format(exc=message)
+        )
+
     def _on_failed(self, message: str) -> None:
+        self._gl.hide()
+        self._class_legend.hide()
         self.show_placeholder(message)
 
 # Registration uses domain PortType values as the single data contract.

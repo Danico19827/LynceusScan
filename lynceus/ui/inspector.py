@@ -187,11 +187,13 @@ class InspectorPanel(QWidget):
     config_changed = Signal(str)  # iid of edited instance
     label_changed = Signal(str)  # iid of renamed instance
     strategy_change_requested = Signal(str, str)  # iid, variant key
+    bulk_action_requested = Signal(str)  # "assign_files" | "delete"
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("inspectorPanel")
         self._item = None
+        self._multi = None
         self._building = False
 
         root = QVBoxLayout(self)
@@ -237,10 +239,67 @@ class InspectorPanel(QWidget):
 
     def set_node(self, item) -> None:
         """Show configuration for the node (None shows placeholder)."""
+        if self._multi is not None:
+            self._multi = None
         if self._item is item:
             return
         self._item = item
         self._rebuild()
+
+    def set_multi(self, items: list) -> None:
+        """Show the multi-selection panel for several selected nodes."""
+        items = [i for i in items if i is not None]
+        if self._multi == items and self._item is None:
+            return
+        self._item = None
+        self._multi = items
+        self._rebuild()
+
+    def _render_multi(self) -> None:
+        """Multi-selection panel: count, type list and batch actions."""
+        count = len(self._multi)
+        self._title.setText(
+            t("{n} nodes selected").format(n=count)
+        )
+        self._title.setProperty("origText_en", "{n} nodes selected")
+        grouped: dict[str, list] = {}
+        for item in self._multi:
+            grouped.setdefault(item.node_id(), []).append(item)
+        labels = sorted(
+            (
+                f"{len(items)}× {items[0].display_name()}"
+                for items in grouped.values()
+            ),
+            key=str.lower,
+        )
+        self._subtitle.setText(", ".join(labels))
+        hint = QLabel(
+            t("Batch actions apply to every selected node")
+        )
+        hint.setObjectName("panelHint")
+        hint.setWordWrap(True)
+        self._form.addRow(hint)
+        buttons = QHBoxLayout()
+        from PySide6.QtWidgets import QPushButton
+
+        queueable = all(
+            getattr(item, "supports_file_queue", False) for item in self._multi
+        )
+        if queueable:
+            assign = QPushButton(t("Assign files..."), self)
+            assign.clicked.connect(
+                lambda: self.bulk_action_requested.emit("assign_files")
+            )
+            buttons.addWidget(assign)
+        delete = QPushButton(t("Delete"), self)
+        delete.clicked.connect(
+            lambda: self.bulk_action_requested.emit("delete")
+        )
+        buttons.addWidget(delete)
+        buttons.addStretch(1)
+        host = QWidget(self)
+        host.setLayout(buttons)
+        self._form.addRow(host)
 
     def refresh(self) -> None:
         """Re-read current node state (e.g. after inline rename)."""
@@ -278,6 +337,10 @@ class InspectorPanel(QWidget):
                 widget = row.widget()
                 if widget is not None:
                     widget.deleteLater()
+
+            if self._item is None and self._multi:
+                self._render_multi()
+                return
 
             if self._item is None:
                 self._title.setText(t("Inspector"))

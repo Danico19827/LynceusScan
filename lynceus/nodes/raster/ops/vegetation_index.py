@@ -164,6 +164,7 @@ def barrier_vegetation_index(ctx: dict) -> dict:
     from lynceus.processing.raster import (
         _valid_bounds,
         read_geotiff_bands,
+        refuse_if_unfit,
         write_geotiff,
     )
 
@@ -201,6 +202,10 @@ def barrier_vegetation_index(ctx: dict) -> dict:
     band_numbers = [
         int(ctx.get(key, band_defaults[key])) for key in band_keys
     ]
+    # Full band cube (float32) plus float64 working copies and masks (~8x
+    # on disk): refuse honestly before any full read.
+    refuse_if_unfit([src], 8.0, ctx.get("_raster_grid_memory_budget_bytes"),
+                    "Vegetation index")
     cubes, transform, crs = read_geotiff_bands(src, band_numbers)
     valid_src = _valid_bounds(cubes[0], transform, nodata)
     crs_out = clean_crs(ctx.get("crs")) or crs

@@ -43,7 +43,16 @@ PROCESSING_SPECS = {
     "input_port": "point_cloud",
     "output_files": {"intensity_ortho": "intensity_mosaic.tif"},
     "output_port": "intensity_ortho",
+    "input_globs": ("intensity/**/*.tif",),
     "output_globs": ("intensity/**/*.tif", "intensity_mosaic.tif"),
+    # CountAccumulator (int32 count + float32 sum): the tile grid scales
+    # with tile AREA at resolution, not with points.
+    "grid_bytes_per_cell": 8,
+    "grid_resolution_keys": ("resolution",),
+    # Dispatch working set in cell copies (merge + median): the gate
+    # budgets the direct need when it fits, the window peak when it
+    # streams.
+    "merge_copies": 5.0,
     "qml": {"intensity_mosaic.tif": "intensity"},
     "config_schema": {
         "resolution": {
@@ -104,7 +113,6 @@ def tile_intensity_ortho(tile: dict, ctx: dict) -> dict:
     from lynceus.processing import provenance
     from lynceus.processing.raster import (
         CountAccumulator,
-        core_mask,
         write_geotiff,
     )
     from lynceus.processing.tiler import _laz_backend
@@ -143,7 +151,7 @@ def tile_intensity_ortho(tile: dict, ctx: dict) -> dict:
             for chunk in reader.chunk_iterator(2_000_000):
                 x = np.asarray(chunk.x)
                 y = np.asarray(chunk.y)
-                mask = core_mask(x, y, tile)
+                mask = acc.extent_mask(x, y)
                 if has_withheld:
                     # Vendor-withheld points are excluded from metrics.
                     mask = mask & ~np.asarray(chunk.withheld, dtype=bool)
@@ -206,11 +214,7 @@ def tile_intensity_ortho(tile: dict, ctx: dict) -> dict:
 def barrier_intensity_ortho(ctx: dict) -> dict:
     """Merge intensity tiles and apply a NODATA-aware median filter."""
     from lynceus.processing import provenance
-    from lynceus.processing.raster import (
-        median_nodata,
-        merge_geotiffs,
-        write_geotiff,
-    )
+    from lynceus.processing.raster import finish_mosaic
 
     prov_doc = provenance.build_provenance(ctx, "intensity_mosaic.tif")
     from lynceus.nodes._paths import scoped_dir, scoped_file
@@ -220,14 +224,14 @@ def barrier_intensity_ortho(ctx: dict) -> dict:
         raise RuntimeError("No intensity tiles generated")
     nodata = float(ctx.get("nodata_value", -9999.0))
     out_path = scoped_file(ctx, "intensity_mosaic.tif")
-    arr, transform, crs = merge_geotiffs(
-        paths, ctx.get("crs"), out_path, nodata=nodata, metadata=prov_doc,
-        return_array=True,
+    median_size = 3 if ctx.get("median_filter_enabled", True) else 0
+    finish_mosaic(
+        paths, out_path, crs=ctx.get("crs"), nodata=nodata, metadata=prov_doc,
+        median_size=median_size,
+        crop_to_valid=False,
+        memory_budget_bytes=ctx.get("_raster_grid_memory_budget_bytes"),
+        notes=ctx.setdefault("_bounded_notes", []),
     )
-
-    if ctx.get("median_filter_enabled", True):
-        arr = median_nodata(arr, size=3, nodata=nodata)
-    write_geotiff(out_path, arr, transform, crs=crs, nodata=nodata, metadata=prov_doc)
 
     return {"file": out_path, "kind": "intensity_ortho", "node": NODE_ID}
 

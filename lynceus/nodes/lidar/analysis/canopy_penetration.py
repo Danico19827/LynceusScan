@@ -41,7 +41,16 @@ PROCESSING_SPECS = {
     "input_port": "point_cloud",
     "output_files": {"canopy_penetration": "canopy_penetration_mosaic.tif"},
     "output_port": "canopy_penetration",
+    "input_globs": ("canopy_penetration/**/*.tif",),
     "output_globs": ("canopy_penetration/**/*.tif", "canopy_penetration_mosaic.tif"),
+    # Two CountAccumulators (int32 count + float32 sum each): the tile grids
+    # scale with tile AREA at resolution, not with points.
+    "grid_bytes_per_cell": 16,
+    "grid_resolution_keys": ("resolution",),
+    # Dispatch working set in cell copies (merge + fill): the gate
+    # budgets the direct need when it fits, the window peak when it
+    # streams.
+    "merge_copies": 12.0,
     "requires": {"classified": True},
     "qml": {"canopy_penetration_mosaic.tif": "penetration"},
     "config_schema": {
@@ -89,7 +98,7 @@ def get_config_defaults() -> dict:
 
 
 def tile_canopy_penetration(tile: dict, ctx: dict) -> dict:
-    """Compute ground/total ratio per cell for one tile (core-masked)."""
+    """Compute ground/total ratio per cell for one tile."""
     import laspy
     import numpy as np
 
@@ -97,7 +106,6 @@ def tile_canopy_penetration(tile: dict, ctx: dict) -> dict:
     from lynceus.processing.raster import (
         GROUND_CLASS,
         CountAccumulator,
-        core_mask,
         write_geotiff,
     )
     from lynceus.processing.tiler import _laz_backend
@@ -131,7 +139,7 @@ def tile_canopy_penetration(tile: dict, ctx: dict) -> dict:
         for chunk in reader.chunk_iterator(2_000_000):
             x = np.asarray(chunk.x)
             y = np.asarray(chunk.y)
-            mask = core_mask(x, y, tile)
+            mask = acc_total.extent_mask(x, y)
             if has_withheld:
                 # Vendor-withheld points are excluded from metrics.
                 mask = mask & ~np.asarray(chunk.withheld, dtype=bool)
@@ -177,11 +185,7 @@ def tile_canopy_penetration(tile: dict, ctx: dict) -> dict:
 def barrier_canopy_penetration(ctx: dict) -> dict:
     """Merge all penetration tiles into a mosaic (optional hole-filling)."""
     from lynceus.processing import provenance
-    from lynceus.processing.raster import (
-        fill_holes,
-        merge_geotiffs,
-        write_geotiff,
-    )
+    from lynceus.processing.raster import finish_mosaic
 
     prov_doc = provenance.build_provenance(ctx, "canopy_penetration_mosaic.tif")
     from lynceus.nodes._paths import scoped_dir, scoped_file
@@ -191,18 +195,15 @@ def barrier_canopy_penetration(ctx: dict) -> dict:
         raise RuntimeError("No canopy penetration tiles generated")
     nodata = float(ctx.get("nodata_value", -9999.0))
     out_path = scoped_file(ctx, "canopy_penetration_mosaic.tif")
-    arr, transform, crs = merge_geotiffs(
-        paths, ctx.get("crs"), out_path, nodata=nodata, metadata=prov_doc,
-        return_array=True,
-    )
-
+    fill_dist = 0.0
     if ctx.get("hole_fill_enabled", False):
-        max_dist = float(ctx.get("hole_fill_max_dist_m", 3.0))
-        if max_dist > 0:
-            resolution = float(ctx.get("resolution", 1.0))
-            arr = fill_holes(arr, resolution, max_dist, nodata)
-    write_geotiff(
-        out_path, arr, transform, crs=crs, nodata=nodata, metadata=prov_doc
+        fill_dist = float(ctx.get("hole_fill_max_dist_m", 3.0))
+    finish_mosaic(
+        paths, out_path, crs=ctx.get("crs"), nodata=nodata, metadata=prov_doc,
+        fill_dist_m=fill_dist, resolution=float(ctx.get("resolution", 1.0)),
+        crop_to_valid=False,
+        memory_budget_bytes=ctx.get("_raster_grid_memory_budget_bytes"),
+        notes=ctx.setdefault("_bounded_notes", []),
     )
 
     return {"file": out_path, "kind": "canopy_penetration", "node": NODE_ID}

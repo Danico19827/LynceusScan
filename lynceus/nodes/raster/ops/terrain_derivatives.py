@@ -37,6 +37,16 @@ INPUTS = ()
 OUTPUTS = ()
 
 PROCESSING_SPECS = {
+    # Working-set estimate for the dispatch gate (executor): Horn holds the
+    # input plus ~4 float64 arrays of raster size (output + 2 gradients +
+    # temporaries), so peak is ~10x the on-disk float32 bytes. Declared once
+    # on the inert base; every variant inherits it through the spec overlay.
+    "memory_factor": 10.0,
+    # Mode-aware dispatch in float64 DEM cells (5 copies direct, window
+    # peak when streaming): the gate budgets the peak of the mode that
+    # runs instead of serializing every derivative. Inherited likewise.
+    "merge_copies": 5.0,
+    "merge_cell_bytes": 8,
     "config_schema": {
         STRATEGY_FIELD: {
             "type": "str",

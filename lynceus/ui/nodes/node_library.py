@@ -18,6 +18,10 @@ class NodeLibrary(QTreeWidget):
         self.setDragDropMode(QTreeWidget.DragDropMode.DragOnly)
         self.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
         self.setAnimated(True)
+        # Compact library: no untranslatable header, tight rows, cheap paint.
+        self.setHeaderHidden(True)
+        self.setIndentation(12)
+        self.setUniformRowHeights(True)
 
         self.itemActivated.connect(self._on_item_activated)
 

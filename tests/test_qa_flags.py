@@ -712,5 +712,98 @@ class CrsOriginWarningTests(unittest.TestCase):
             )
 
 
+class FilterQAFlagsTests(unittest.TestCase):
+    def _tile_ctx(self, root: Path, mode: str):
+        from lynceus.nodes.lidar.clean.filter_qa_flags import (
+            tile_filter_qa_flags,
+        )
+
+        src = _write_cloud(
+            root / "s.laz",
+            overlap=np.arange(200) < 40,
+            synthetic=(np.arange(200) >= 40) & (np.arange(200) < 70),
+        )
+        tile = {"tile_id": "t_c0000_r0000", "file": str(src)}
+        ctx = {"session_dir": str(root / "s"),
+               "intermediate_ext": "laz", "mode": mode}
+        return tile_filter_qa_flags(tile, ctx)
+
+    def test_remove_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._tile_ctx(Path(tmp), "remove_overlap")
+            rec = _read_record(out["output"])
+            self.assertEqual(len(rec), 160)
+            self.assertFalse(bool(np.asarray(rec.overlap).any()))
+
+    def test_remove_synthetic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._tile_ctx(Path(tmp), "remove_synthetic")
+            rec = _read_record(out["output"])
+            self.assertEqual(len(rec), 170)
+            self.assertFalse(bool(np.asarray(rec.synthetic).any()))
+
+    def test_remove_all_qa(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._tile_ctx(Path(tmp), "remove_all_qa")
+            rec = _read_record(out["output"])
+            self.assertEqual(len(rec), 130)
+
+    def test_only_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._tile_ctx(Path(tmp), "only_overlap")
+            rec = _read_record(out["output"])
+            self.assertEqual(len(rec), 40)
+            self.assertTrue(bool(np.asarray(rec.overlap).all()))
+
+    def test_legacy_format_passes_through(self) -> None:
+        from lynceus.nodes.lidar.clean.filter_qa_flags import (
+            tile_filter_qa_flags,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = _write_cloud(root / "s.laz", point_format=3)
+            tile = {"tile_id": "t_c0000_r0000", "file": str(src)}
+            ctx = {"session_dir": str(root / "s"),
+                   "intermediate_ext": "laz", "mode": "remove_overlap"}
+            out = tile_filter_qa_flags(tile, ctx)
+            rec = _read_record(out["output"])
+            self.assertEqual(len(rec), 200)
+            self.assertTrue(out.get("warnings"))
+
+    def test_unknown_mode_raises(self) -> None:
+        from lynceus.nodes.lidar.clean.filter_qa_flags import (
+            tile_filter_qa_flags,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = _write_cloud(root / "s.laz")
+            tile = {"tile_id": "t_c0000_r0000", "file": str(src)}
+            ctx = {"session_dir": str(root / "s"),
+                   "intermediate_ext": "laz", "mode": "sideways"}
+            with self.assertRaisesRegex(ValueError, "unknown mode"):
+                tile_filter_qa_flags(tile, ctx)
+
+    def test_registered_with_ports(self) -> None:
+        from lynceus.nodes.lidar.clean.filter_qa_flags import (
+            PROCESSING_SPECS,
+        )
+        from lynceus.nodes.ports import PortType, port_metadata
+        from lynceus.plugins.registry import manager
+
+        module_id = "lynceus.nodes.lidar.clean.filter_qa_flags"
+        manager.discover()
+        self.assertIsNotNone(manager.node_info(module_id))
+        inputs, outputs = manager.load_ports(module_id)
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(port_metadata(inputs[0]).port_type,
+                         PortType.POINT_CLOUD)
+        self.assertTrue(port_metadata(inputs[0]).required)
+        self.assertEqual(PROCESSING_SPECS.get("passes_flags"),
+                         ("classified",))
+
+
 if __name__ == "__main__":
     unittest.main()

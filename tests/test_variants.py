@@ -143,6 +143,8 @@ class DagTests(unittest.TestCase):
         self.assertEqual(by_id["a|merge"].deps, set())
 
     def test_consumer_injects_provider_path_by_port(self) -> None:
+        from lynceus.processing.executor import _task_ctx
+
         tasks = build_dag(
             ["in", "chm"],
             [("in", "chm", CHM_MOSAIC, CHM_MOSAIC)],
@@ -152,7 +154,10 @@ class DagTests(unittest.TestCase):
             configs={"in": {"strategy": "chm"}},
         )
         chm_task = next(t for t in tasks if t.task_id == "chm|merge")
-        ctx = chm_task.args[0]
+        # Resolve through the production envelope-unwrapper (barrier args
+        # travel wrapped since F4): the contract is a resolvable ctx, not
+        # a positional shape.
+        ctx = _task_ctx(chm_task)
         self.assertEqual(
             ctx.get("chm_mosaic_path"),
             r"unused\in\chm_mosaic.tif",

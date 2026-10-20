@@ -41,7 +41,7 @@ DEFAULT_RAMP = "generic"
 # columns belong to the producing node and are declared in its sidecar.
 BOOKKEEPING_COLS = {"gid", "fid", "ogc_fid"}
 
-_RASTER_EXT = {".tif", ".tiff"}
+_RASTER_EXT = {".tif", ".tiff", ".vrt"}
 # No SHP: reading it would pull geopandas/pyogrio (a second PROJ build)
 # into the GUI process, which crashes natively next to rasterio's PROJ.
 _VECTOR_EXT = {".gpkg", ".geojson"}
@@ -328,18 +328,32 @@ def _read_raster_stats(
     try:
         import numpy as np
         import rasterio
+        from rasterio.windows import Window
 
         with rasterio.open(str(raster_path)) as src:
-            band = src.read(1)
             nodata = src.nodata
-            if nodata is not None:
-                valid = band[band != nodata]
-            else:
-                valid = band[~np.isnan(band)]
-            if valid.size == 0:
+            width, height = int(src.width), int(src.height)
+            lo, hi = np.inf, -np.inf
+            for start in range(0, height, 1024):
+                rows = min(1024, height - start)
+                band = src.read(1, window=Window(0, start, width, rows))
+                # NaN voids never count as data, with or without a tag: a
+                # stray NaN would otherwise poison min/max (and the viewer
+                # stretch). Strip streaming keeps the peak at one strip,
+                # never the mosaic — same exact min/max as a full read.
+                finite = np.isfinite(band)
+                if nodata is not None:
+                    valid = band[(band != nodata) & finite]
+                else:
+                    valid = band[finite]
+                if valid.size == 0:
+                    continue
+                lo = min(lo, float(valid.min()))
+                hi = max(hi, float(valid.max()))
+            if not np.isfinite(lo):
                 logger.warning(f"No valid data in: {raster_path.name}")
                 return None
-            return float(valid.min()), float(valid.max()), nodata
+            return lo, hi, nodata
     except Exception as e:
         logger.error(f"Error reading raster {raster_path.name}: {e}")
         return None
@@ -349,26 +363,39 @@ def _looks_discrete(raster_path: Path) -> bool:
     """Return whether a raster looks categorical: few integer classes in 0..9.
 
     Used only for generic fallback styling: a small integer set is likely a
-    mask or class raster rather than a continuous surface.
+    mask or class raster rather than a continuous surface. Streaming with
+    early exit: a continuous surface trips the >8-uniques or non-integer
+    guard within the first strips (the unique set never grows), so peak
+    stays at one strip with the exact same verdict as a full read.
     """
     try:
         import numpy as np
         import rasterio
+        from rasterio.windows import Window
 
         with rasterio.open(str(raster_path)) as src:
-            band = src.read(1)
             nodata = src.nodata
-        if nodata is not None:
-            valid = band[band != nodata]
-        else:
-            valid = band[~np.isnan(band)]
-        if valid.size == 0:
+            width, height = int(src.width), int(src.height)
+            seen: set = set()
+            for start in range(0, height, 1024):
+                rows = min(1024, height - start)
+                band = src.read(1, window=Window(0, start, width, rows))
+                if nodata is not None:
+                    valid = band[(band != nodata) & np.isfinite(band)]
+                else:
+                    valid = band[np.isfinite(band)]
+                if valid.size == 0:
+                    continue
+                values = np.unique(valid)
+                if not np.allclose(values, values.astype(int)):
+                    return False
+                seen.update(int(v) for v in values.tolist())
+                if len(seen) > 8:
+                    return False
+        if not seen:
             return False
-        values = np.unique(valid)
-        if not np.allclose(values, values.astype(int)):
-            return False
-        classes = values.astype(int)
-        return 2 <= classes.size <= 8 and classes.min() >= 0 and classes.max() < 10
+        classes = sorted(seen)
+        return 2 <= len(classes) <= 8 and classes[0] >= 0 and classes[-1] < 10
     except Exception:
         return False
 
@@ -498,6 +525,120 @@ def generate_discrete_qml(
     return True
 
 
+def _apply_ramp_clamps(ramp_key: Optional[str], min_val: float,
+                       max_val: float) -> tuple[float, float]:
+    """Catalog-ramp range clamps shared by pixel and VRT styling.
+
+    Custom entries bring their own min/max (applied by the caller, winning).
+    """
+    if ramp_key == "chm":
+        min_val = 0.0
+    elif ramp_key == "penetration":
+        min_val = 0.0
+        max_val = 1.0
+    elif ramp_key == "hillshade":
+        min_val = 0.0
+        max_val = 255.0
+    elif ramp_key == "coverage":
+        min_val = 0.0
+        max_val = max(max_val, 5.0)
+    elif ramp_key == "aspect":
+        min_val = 0.0
+        max_val = 360.0
+    elif ramp_key == "vertical":
+        min_val = 0.0
+    elif ramp_key == "echo_ratio":
+        min_val = 0.0
+        max_val = 1.0
+    elif ramp_key == "density":
+        min_val = 0.0
+        max_val = max(max_val, 1.0)
+    elif ramp_key == "ground_density":
+        min_val = 0.0
+        max_val = max(max_val, 1.0)
+    elif ramp_key == "ground_std":
+        min_val = 0.0
+        max_val = max(max_val, 1.0)
+    elif ramp_key == "ndgi":
+        min_val = -0.5
+        max_val = 0.5
+    return min_val, max_val
+
+
+def generate_vrt_qml(vrt_path: str, source_qml_paths: list,
+                     ramp_hint: Optional[str] = None) -> bool:
+    """Write the ``<vrt>.qml`` of a mosaic VRT from its sources' styles.
+
+    No pixel is read: continuous ramps reuse the catalog entry stretched
+    over the UNION of the sources' classification ranges (one scale for the
+    whole mosaic, no per-segment cuts), and unanimous palettes are copied
+    byte for byte (class semantics are identical by construction). Anything
+    heterogeneous returns False so the caller warns instead of styling
+    wrong. Return True only when the sidecar is written.
+    """
+    vpath = Path(vrt_path)
+    if vpath.suffix.lower() != ".vrt":
+        return False
+    qmls = [str(p) for p in source_qml_paths or []]
+    if not qmls:
+        return False
+    palettes = [read_palette_entries(q) for q in qmls]
+    if all(p is not None for p in palettes):
+        if all(p == palettes[0] for p in palettes[1:]):
+            try:
+                raw = Path(qmls[0]).read_bytes()
+            except OSError:
+                return False
+            try:
+                vpath.with_suffix(".qml").write_bytes(raw)
+            except OSError:
+                return False
+            logger.info(f"QML style: {vpath.name} (shared palette)")
+            return True
+        return False
+    ranges = []
+    for qml in qmls:
+        parsed = read_ramp_stops(qml)
+        if parsed is None:
+            return False
+        lo, hi, stops = parsed
+        colors = tuple(c for _, c, _ in stops)
+        values = [v for v, _, _ in stops]
+        if values != sorted(values):
+            values = sorted(values)
+            reversed_ = True
+        else:
+            reversed_ = False
+        ranges.append((lo, hi, colors, reversed_))
+    first_colors = ranges[0][2]
+    if any(r[2] != first_colors or r[3] != ranges[0][3] for r in ranges[1:]):
+        return False
+    lo = min(r[0] for r in ranges)
+    hi = max(r[1] for r in ranges)
+    ramp_key = ramp_hint if ramp_hint in RAMPS else None
+    if ramp_key is None:
+        ramp_key = detect_ramp(vpath.stem) or DEFAULT_RAMP
+    if ramp_key not in RAMPS:
+        ramp_key = DEFAULT_RAMP
+    entry = RAMPS[ramp_key]
+    if lo == hi:
+        lo -= 1.0
+        hi += 1.0
+    lo, hi = _apply_ramp_clamps(ramp_key, lo, hi)
+    try:
+        content = _build_qml(
+            vpath, entry, lo, hi, ranges[0][3])
+    except Exception as e:
+        logger.error(f"Error generating QML for {vpath.name}: {e}")
+        return False
+    try:
+        vpath.with_suffix(".qml").write_text(content, encoding="utf-8")
+    except OSError:
+        return False
+    logger.info(f"QML style: {vpath.name} ({entry.get('name')}, {lo:.1f}–{hi:.1f})")
+    return True
+
+
 def generate_qml(
     raster_path: str,
     ramp_key: Optional[str] = None,
@@ -554,37 +695,7 @@ def generate_qml(
     # The catalog-ramp clamps below apply only to catalog ramps (custom
     # entries bring their own min/max, applied right after and winning).
 
-    if ramp_key == "chm":
-        min_val = 0.0
-    elif ramp_key == "penetration":
-        min_val = 0.0
-        max_val = 1.0
-    elif ramp_key == "hillshade":
-        min_val = 0.0
-        max_val = 255.0
-    elif ramp_key == "coverage":
-        min_val = 0.0
-        max_val = max(max_val, 5.0)
-    elif ramp_key == "aspect":
-        min_val = 0.0
-        max_val = 360.0
-    elif ramp_key == "vertical":
-        min_val = 0.0
-    elif ramp_key == "echo_ratio":
-        min_val = 0.0
-        max_val = 1.0
-    elif ramp_key == "density":
-        min_val = 0.0
-        max_val = max(max_val, 1.0)
-    elif ramp_key == "ground_density":
-        min_val = 0.0
-        max_val = max(max_val, 1.0)
-    elif ramp_key == "ground_std":
-        min_val = 0.0
-        max_val = max(max_val, 1.0)
-    elif ramp_key == "ndgi":
-        min_val = -0.5
-        max_val = 0.5
+    min_val, max_val = _apply_ramp_clamps(ramp_key, min_val, max_val)
 
     if entry.get("min") is not None:
         min_val = float(entry["min"])
@@ -936,6 +1047,46 @@ def generate_for_file(path: str, spec=None) -> bool:
         field = spec if isinstance(spec, str) else None
         return style_vector_file(path, field=field)
     return False
+
+
+def read_ramp_stops(qml_path: str) -> Optional[tuple[float, float, list]]:
+    """Reads a continuous ``singlebandpseudocolor`` ramp from a ``.qml``.
+
+    Returns ``(minimum, maximum, [(value, color, label), ...])`` — the same
+    mapping QGIS renders (linear interpolation between item values, edge
+    colors outside, per ``clip="0"``). None if the qml does not exist, is
+    not continuous or cannot be parsed (pure domain, no Qt). This is the
+    base the 2D viewer shares with QGIS so previews stop looking like a
+    different product.
+    """
+    try:
+        import xml.etree.ElementTree as ET
+
+        root = ET.parse(qml_path).getroot()
+    except (ET.ParseError, OSError, ValueError):
+        return None
+    renderer = root.find(".//rasterrenderer[@type='singlebandpseudocolor']")
+    if renderer is None:
+        return None
+    try:
+        minimum = float(renderer.get("classificationMin"))
+        maximum = float(renderer.get("classificationMax"))
+    except (TypeError, ValueError):
+        return None
+    stops = []
+    for el in root.iter("item"):
+        try:
+            stops.append(
+                (float(el.get("value")), str(el.get("color")),
+                 str(el.get("label") or ""))
+            )
+        except (TypeError, ValueError):
+            continue
+    if not stops or not all(
+        stops[i][0] <= stops[i + 1][0] for i in range(len(stops) - 1)
+    ):
+        return None
+    return minimum, maximum, stops
 
 
 def read_palette_entries(qml_path: str) -> Optional[list[tuple[int, str, str]]]:

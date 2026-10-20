@@ -20,6 +20,8 @@ _ITEM_FACTORIES = {
     "lynceus.nodes.lidar.terrain.classify_ground": MethodNodeItem,
     # Merge products per strategy (one Consolidate instance per product).
     "lynceus.nodes.flow.consolidate": MergeNodeItem,
+    # Merge rasters per strategy (one Merge Rasters instance per product).
+    "lynceus.nodes.raster.ops.merge_rasters": MergeNodeItem,
     "lynceus.nodes.raster.ops.terrain_derivatives": DerivativeNodeItem,
 }
 

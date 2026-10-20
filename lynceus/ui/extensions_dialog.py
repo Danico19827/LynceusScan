@@ -24,12 +24,14 @@ from typing import Callable
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
+    QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QTextEdit,
@@ -50,6 +52,12 @@ from lynceus.plugins.store import (
     PACK_EULA_PENDING,
     PACK_INSTALLED,
     ConsentStore,
+)
+from lynceus.ui.dialogs import (
+    ask_yes_no,
+    show_critical,
+    show_info,
+    show_warning,
 )
 from lynceus.ui.widgets import CollapsibleSection
 
@@ -212,7 +220,13 @@ class _EulaDialog(QDialog):
             | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText(t("Accept"))
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty(
+            "origText_en", "Accept"
+        )
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(t("Decline"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setProperty(
+            "origText_en", "Decline"
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -238,10 +252,21 @@ class ExtensionsDialog(QDialog):
         self.setWindowTitle(t("Extensions"))
         self.setProperty("origWinTitle_en", "Extensions")
         self.setModal(False)
+        # One-shot dialog: destroyed on close so reopening never stacks
+        # language_changed connections on dead instances.
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setAcceptDrops(True)
         self.resize(720, 540)
 
         root = QVBoxLayout(self)
+
+        # --- search (name / author / id) ---
+        self._search = QLineEdit()
+        self._search.setClearButtonEnabled(True)
+        self._search.setProperty("origPh_en", "Search extensions...")
+        self._search.setPlaceholderText(t("Search extensions..."))
+        self._search.textChanged.connect(self._apply_filter)
+        root.addWidget(self._search)
 
         # --- extensions list (compact rows in a column) ---
         self._scroll = QScrollArea()
@@ -289,6 +314,7 @@ class ExtensionsDialog(QDialog):
 
         language_changed.connect(self._on_language_changed)
 
+        self._row_entries: dict[str, dict] = {}
         self._rebuild()
 
     def _on_language_changed(self, _code: str) -> None:
@@ -334,12 +360,18 @@ class ExtensionsDialog(QDialog):
                 errors += 1
                 messages.append(f"{path.name}: {exc}")
         self._after_change()
-        box = QMessageBox.warning if errors else QMessageBox.information
-        box(
-            self,
-            t("Import extension"),
-            "\n".join(messages),
-        )
+        if errors:
+            show_warning(
+                self,
+                t("Import extension"),
+                "\n".join(messages),
+            )
+        else:
+            show_info(
+                self,
+                t("Import extension"),
+                "\n".join(messages),
+            )
 
     # -- drag & drop --------------------------------------------------------
 
@@ -373,6 +405,7 @@ class ExtensionsDialog(QDialog):
         self._list_layout.addStretch(1)
 
         rows = list(self._extension_entries())
+        self._row_entries = {row["node_id"]: row for row in rows}
         if not rows:
             info = QLabel(
                 t(
@@ -398,6 +431,7 @@ class ExtensionsDialog(QDialog):
             self._list_layout.insertWidget(
                 self._list_layout.count() - 1, section
             )
+        self._apply_filter()
 
     @staticmethod
     def _group_entries(entries: list[dict]) -> list[tuple[str, list[dict]]]:
@@ -531,41 +565,142 @@ class ExtensionsDialog(QDialog):
         return sorted(entries, key=lambda e: e["node_id"])
 
     def _build_row(self, entry: dict) -> QWidget:
+        """Two-line card: status dot + name + meta on top, id/author below."""
         row = QWidget()
-        layout = QVBoxLayout(row)
-        layout.setContentsMargins(6, 6, 6, 6)
+        row.setObjectName("extRow")
+        # Plain QWidgets never paint QSS backgrounds without this.
+        row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        row.setProperty("node_id", entry["node_id"])
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(2)
 
-        head = QHBoxLayout()
-        title = QLabel(
-            f"<b>{entry['display_name']}</b>  "
-            f'<span style="color:#8a93a6">{entry["detail"]}</span>'
-        )
-        head.addWidget(title, 1)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(8)
 
         status = self._entry_status(entry)
-        if entry["node_id"] in self._store.disabled_ids():
-            badge = QLabel(t("Disabled"))
+        disabled = entry["node_id"] in self._store.disabled_ids()
+        if disabled:
+            state, tip = "disabled", t("Disabled")
         else:
-            badge = QLabel(t(_STATE_LABEL.get(status.state, status.state)))
-        badge.setObjectName("statusBadge")
-        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        head.addWidget(badge, 0)
-        layout.addLayout(head)
+            state = ("pending"
+                     if status.state == PACK_EULA_PENDING else "ok")
+            tip = t(_STATE_LABEL.get(status.state, status.state))
+        dot = QLabel()
+        dot.setObjectName("statusDot")
+        dot.setProperty("extState", state)
+        dot.setFixedSize(8, 8)
+        dot.setToolTip(tip)
+        top.addWidget(dot, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        meta = f"by {entry['author'] or 'Unknown'} · {entry['license']}"
-        sub = QLabel(meta)
-        sub.setObjectName("hintLabel")
-        layout.addWidget(sub)
+        name = QLabel(entry["display_name"])
+        name.setObjectName("extName")
+        top.addWidget(name)
+        top.addStretch(1)
 
-        details = CollapsibleSection(t("Details"))
-        details.content_layout().addWidget(self._build_details(entry))
-        layout.addWidget(details)
+        meta = QLabel(entry.get("license") or "")
+        meta.setObjectName("extMeta")
+        top.addWidget(meta)
 
-        actions = QHBoxLayout()
-        actions.addStretch(1)
-        self._append_actions(actions, entry, status)
-        layout.addLayout(actions)
+        check = QCheckBox()
+        check.setChecked(not disabled)
+        check.setToolTip(t("Enable") if disabled else t("Disable"))
+        # clicked (not toggled): user gestures only, never rebuild loops.
+        check.clicked.connect(
+            lambda _=False, e=entry: self._toggle_enabled(e)
+        )
+        top.addWidget(check)
+
+        overflow = QPushButton("\u00b7\u00b7\u00b7")
+        overflow.setObjectName("extOverflow")
+        overflow.setFixedWidth(30)
+        overflow.setToolTip(t("Details"))
+        overflow.setProperty("origTip_en", "Details")
+        overflow.clicked.connect(
+            lambda _=False, e=entry: self._row_menu(e, overflow)
+        )
+        top.addWidget(overflow)
+        outer.addLayout(top)
+
+        sub = entry.get("detail") or ""
+        author = (entry.get("author") or "").strip()
+        if author:
+            sub = f"{sub}  \u00b7  {author}" if sub else author
+        detail = QLabel(sub)
+        detail.setObjectName("extDetail")
+        outer.addWidget(detail)
+
+        folder = entry.get("folder")
+        row.setToolTip(
+            f"{entry['author'] or 'Unknown'} \u00b7 {entry['license']}"
+            + (f"\n{folder}" if folder else "")
+        )
         return row
+
+    def _row_menu(self, entry: dict, anchor: QWidget) -> None:
+        """Overflow actions for one row (Details/EULA/Open folder/Remove)."""
+        menu = QMenu(anchor)
+        details_action = menu.addAction(t("Details"))
+        details_action.triggered.connect(
+            lambda: self._show_details(entry)
+        )
+        eula = entry["eula"]
+        if eula and not self._store.eula_accepted_for(
+            entry["node_id"], eula
+        ):
+            eula_action = menu.addAction(t("Review EULA"))
+            eula_action.triggered.connect(
+                lambda: self._accept_eula(entry)
+            )
+        open_action = menu.addAction(t("Open folder"))
+        open_action.triggered.connect(
+            lambda: self._open_folder(entry)
+        )
+        remove_action = menu.addAction(t("Remove"))
+        remove_action.triggered.connect(
+            lambda: self._remove_extension(entry)
+        )
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+
+    def _show_details(self, entry: dict) -> None:
+        """Modal metadata sheet for one entry (reuses the details builder)."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(t("Details"))
+        dialog.setProperty("origWinTitle_en", "Details")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(self._build_details(entry))
+        close_btn = QPushButton(t("Close"))
+        close_btn.setProperty("origText_en", "Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        dialog.exec()
+
+    def _apply_filter(self, _text: str = "") -> None:
+        """Hide rows (and emptied groups) not matching name/author/id."""
+        needle = self._search.text().strip().lower()
+        for idx in range(self._list_layout.count()):
+            section = self._list_layout.itemAt(idx).widget()
+            if not isinstance(section, CollapsibleSection):
+                continue
+            any_visible = False
+            content = section.content_layout()
+            for row_idx in range(content.count()):
+                row = content.itemAt(row_idx).widget()
+                if row is None or not row.property("node_id"):
+                    continue
+                entry = self._row_entries.get(row.property("node_id"))
+                if entry is None:
+                    continue
+                match = (
+                    not needle
+                    or needle in str(entry.get("display_name", "")).lower()
+                    or needle in str(entry.get("author", "")).lower()
+                    or needle in str(entry.get("node_id", "")).lower()
+                )
+                row.setVisible(match)
+                any_visible = any_visible or match
+            section.setVisible(any_visible)
 
     def _build_details(self, entry: dict) -> QWidget:
         """Detail widget listing optional metadata (contributors, links...)."""
@@ -629,38 +764,6 @@ class ExtensionsDialog(QDialog):
             return PackStatus(PACK_INSTALLED)
         return self._store.resolve(manifest)
 
-    def _append_actions(self, layout: QHBoxLayout, entry: dict, status) -> None:
-        eula = entry["eula"]
-        if eula:
-            accepted = self._store.eula_accepted_for(
-                entry["node_id"], eula
-            )
-            if not accepted:
-                eula_btn = QPushButton(t("Review EULA"))
-                eula_btn.clicked.connect(
-                    lambda _=False, e=entry: self._accept_eula(e)
-                )
-                layout.addWidget(eula_btn)
-
-        open_btn = QPushButton(t("Open folder"))
-        open_btn.clicked.connect(
-            lambda _=False, e=entry: self._open_folder(e)
-        )
-        layout.addWidget(open_btn)
-
-        disabled = entry["node_id"] in self._store.disabled_ids()
-        toggle_btn = QPushButton(t("Enable") if disabled else t("Disable"))
-        toggle_btn.clicked.connect(
-            lambda _=False, e=entry: self._toggle_enabled(e)
-        )
-        layout.addWidget(toggle_btn)
-
-        remove_btn = QPushButton(t("Remove"))
-        remove_btn.clicked.connect(
-            lambda _=False, e=entry: self._remove_extension(e)
-        )
-        layout.addWidget(remove_btn)
-
     # -- row actions --------------------------------------------------------
 
     def _toggle_enabled(self, entry: dict) -> None:
@@ -677,7 +780,7 @@ class ExtensionsDialog(QDialog):
         """
         if not self._active_check():
             return False
-        QMessageBox.information(
+        show_info(
             self,
             t("Run in progress"),
             t(
@@ -690,16 +793,14 @@ class ExtensionsDialog(QDialog):
     def _remove_extension(self, entry: dict) -> None:
         if self._warn_if_running():
             return
-        ret = QMessageBox.question(
+        if not ask_yes_no(
             self,
             t("Remove extension"),
             t(
                 "This will delete the extension files from the extensions "
                 "directory."
             ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if ret != QMessageBox.StandardButton.Yes:
+        ):
             return
         try:
             if entry["kind"] == "node" and entry.get("file"):
@@ -709,7 +810,7 @@ class ExtensionsDialog(QDialog):
             else:
                 return
         except Exception as exc:  # keep app alive
-            QMessageBox.critical(
+            show_critical(
                 self, t("Remove extension"), str(exc)
             )
             return
@@ -743,32 +844,17 @@ class ExtensionsDialog(QDialog):
 
     def select_extension(self, extension_id: str) -> None:
         """Bring a specific extension into view (used by the add-node gate)."""
+        self._search.setText("")
         for idx in range(self._list_layout.count()):
             item = self._list_layout.itemAt(idx)
             section = item.widget()
             if not isinstance(section, CollapsibleSection):
                 continue
-            target = self._find_row_in_section(section, extension_id)
-            if target is None:
-                continue
-            if not section.is_expanded:
-                section.expand()
-            self._scroll.ensureWidgetVisible(target)
-            return
-
-    @staticmethod
-    def _find_row_in_section(
-        section: CollapsibleSection, extension_id: str
-    ):
-        """Row widget inside a section whose labels mention `extension_id`."""
-        for i in range(section.content_layout().count()):
-            item = section.content_layout().itemAt(i)
-            widget = item.widget()
-            if widget is None:
-                continue
-            if any(
-                extension_id in label.text()
-                for label in widget.findChildren(QLabel)
-            ):
-                return widget
-        return None
+            content = section.content_layout()
+            for row_idx in range(content.count()):
+                row = content.itemAt(row_idx).widget()
+                if row is not None and row.property("node_id") == extension_id:
+                    if not section.is_expanded:
+                        section.expand()
+                    self._scroll.ensureWidgetVisible(row)
+                    return

@@ -169,7 +169,9 @@ class PointCloudViewerTests(unittest.TestCase):
         query_kwargs = copc_context.__enter__.return_value.query.call_args.kwargs
         self.assertIn("bounds", query_kwargs)
         self.assertGreater(query_kwargs["resolution"], 0)
-        las_open.assert_called_once_with("sample.laz")
+        las_open.assert_called_once_with(
+            "sample.laz", laz_backend=laspy.LazBackend.LazrsParallel
+        )
 
     def test_copc_without_query_capability_falls_back_to_chunk_reader(self) -> None:
         header = laspy.LasHeader(point_format=3, version="1.2")

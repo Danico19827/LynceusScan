@@ -22,6 +22,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -35,7 +36,13 @@ from lynceus.processing.acceleration import (
     VALID_MODES,
     resolve_acceleration,
 )
-from lynceus.processing.executor import create_pool, run_dag
+from lynceus.processing.executor import (
+    _predictive_budget,
+    _task_est_bytes,
+    create_pool,
+    default_workers,
+    run_dag,
+)
 from lynceus.processing import provenance as prov
 from lynceus.processing.raster import RASTER_CELL_SIZE
 from lynceus.processing.steps import (
@@ -45,10 +52,34 @@ from lynceus.processing.steps import (
     compile_pipeline,
     discover_node_capabilities,
     effective_node_caps,
+    prune_nodes,
 )
 from lynceus.processing.tiler import LiDARTiler, default_memory_budget_bytes
 
 logger = logging.getLogger(__name__)
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """One-line failure reason carrying the root cause (F0).
+
+    Chained errors (rasterio's "Write failed. See previous exception")
+    state the symptom first and hide the cause in later lines; keeping
+    only the first line diagnosed nothing (Fairbanks 20261014). The
+    reason keeps the first line plus the last distinct line, capped at
+    400 chars total.
+    """
+    lines = [ln.strip() for ln in str(exc).strip().splitlines()]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return "unknown error"
+    first = lines[0]
+    if len(lines) > 1 and lines[-1] != first:
+        reason = f"{first} | caused by: {lines[-1]}"
+    else:
+        reason = first
+    if len(reason) > 400:
+        reason = reason[:400] + "…"
+    return reason
 
 
 def _module_source_files(module_id: str, config, registry=None) -> list[str]:
@@ -116,6 +147,25 @@ def default_output_root() -> Path:
     return Path(__file__).resolve().parents[2] / "output"
 
 
+def resolve_output_root(custom_root: str = "") -> Path:
+    """Active output root: the configured one (item 43) or the default.
+
+    ``custom_root`` mirrors the ``OUTPUT_ROOT_KEY`` QSettings value (the
+    Preferences > General > Output folder): a non-empty absolute path wins;
+    a relative one becomes a subfolder of the default root; an empty string
+    keeps ``default_output_root()``. ``~`` is expanded. Existing sessions
+    are never migrated: switching the root only redirects future runs, so
+    old sessions remain reachable on their original disk location.
+    """
+    custom = (custom_root or "").strip()
+    if custom:
+        path = Path(custom).expanduser()
+        if not path.is_absolute():
+            path = default_output_root() / path
+        return path
+    return default_output_root()
+
+
 def _noop_barrier(payload: dict) -> dict:
     """Return a cached barrier payload without recomputing the node.
 
@@ -123,6 +173,12 @@ def _noop_barrier(payload: dict) -> dict:
     replaced barrier only republishes its previous payload.
     """
     return payload
+
+
+def _tiling_message(p: int, t: int, rate_mps: float) -> str:
+    """Rate-aware tiling progress text (motor EN, no catalog key)."""
+    pct = int(p / t * 100) if t else 0
+    return f"Tiling... {pct}% ({rate_mps:.1f} M pts/s)"
 
 
 def _safe_dir_name(name: str) -> str:
@@ -144,7 +200,12 @@ class PipelineCallbacks:
     ``kind`` is one of ``info``, ``action``, ``success``, ``warning``, or
     ``error``. Other callbacks report node status, tile counts, completion,
     progress, cancellation, per-segment starts/outputs and the final
-    consolidated outputs.
+    consolidated outputs. ``on_run_closed`` fires once the pool is torn
+    down after the run (post-cleanup): chained drivers (file queues) must
+    start the next run from there, never from ``on_finished`` (the old
+    pool is still alive until cleanup joins it). ``on_barrier_outputs``
+    publishes each barrier payload at completion (incremental gallery);
+    ``on_barrier_started`` announces a barrier dispatch (phase chip).
     """
 
     def __init__(
@@ -158,6 +219,9 @@ class PipelineCallbacks:
         on_segment_started: Callable[[int, int, int], None] | None = None,
         on_segment_outputs: Callable[[int, int, dict], None] | None = None,
         on_consolidated_outputs: Callable[[dict], None] | None = None,
+        on_run_closed: Callable[[], None] | None = None,
+        on_barrier_outputs: Callable[[str, dict], None] | None = None,
+        on_barrier_started: Callable[[str], None] | None = None,
     ):
         self.on_message = on_message
         self.on_node_status = on_node_status
@@ -168,6 +232,45 @@ class PipelineCallbacks:
         self.on_segment_started = on_segment_started
         self.on_segment_outputs = on_segment_outputs
         self.on_consolidated_outputs = on_consolidated_outputs
+        self.on_run_closed = on_run_closed
+        self.on_barrier_outputs = on_barrier_outputs
+        self.on_barrier_started = on_barrier_started
+
+
+def _segment_raster_groups(segment_output_payloads, seg_dirs, barrier_iids):
+    """Group per-segment barrier rasters by segment-relative path.
+
+    ``segment_output_payloads[k]`` is the ``{iid: payload}`` dict of batch
+    ``k`` and ``seg_dirs[k]`` its session directory. Only string payload
+    values of barrier/consolidate instances that point at existing
+    ``.tif``/``.tiff`` files inside the segment directory qualify — tile
+    streams live in tile results, never in barrier payloads. Returns
+    ``{relpath: [(producer_iid, abs_path), ...]}`` with multi-source groups
+    only, both levels deterministically ordered. Pure (unit-testable).
+    """
+    groups: dict[str, list] = {}
+    for payloads, seg_dir in zip(segment_output_payloads, seg_dirs):
+        if not isinstance(payloads, dict):
+            continue
+        for iid, payload in sorted(payloads.items()):
+            if iid not in barrier_iids or not isinstance(payload, dict):
+                continue
+            seen: set[str] = set()
+            for value in payload.values():
+                if not isinstance(value, str) or not value:
+                    continue
+                if Path(value).suffix.lower() not in (".tif", ".tiff"):
+                    continue
+                if value in seen or not Path(value).is_file():
+                    continue
+                seen.add(value)
+                try:
+                    rel = Path(value).relative_to(seg_dir).as_posix()
+                except ValueError:
+                    continue
+                groups.setdefault(rel, []).append((iid, value))
+    return {rel: members for rel, members in sorted(groups.items())
+            if len(members) > 1}
 
 
 class PipelineController:
@@ -271,6 +374,7 @@ class PipelineController:
         memory_budget_bytes: int | None = None,
         operator: dict | None = None,
         keep_intermediates: bool = False,
+        file_overrides: dict[str, str] | None = None,
     ) -> None:
         """Start a complete pipeline run in a background worker.
 
@@ -287,6 +391,11 @@ class PipelineController:
         previous sessions. Off: the session keeps only final products and
         every run re-tiles and recomputes from scratch. The flag never
         enters fingerprints (it changes which files remain, not bytes).
+        ``file_overrides`` maps one file-backed instance to the file THIS
+        run uses (file queues, ``--source``): loader files replace their
+        ``source_paths`` entry, product-input files their config key. The
+        caller's mappings are never mutated; the overridden file seeds
+        fingerprints like a picked one.
         """
         self._run_max_workers = max_workers
         self._run_memory_budget_bytes = memory_budget_bytes
@@ -298,6 +407,7 @@ class PipelineController:
             args=(
                 nodes, edges, source_paths, cb, session_root, configs,
                 max_workers, memory_budget_bytes, keep_intermediates,
+                dict(file_overrides or {}),
             ),
             daemon=True,
         ).start()
@@ -350,6 +460,12 @@ class PipelineController:
                 cb.on_cancelled()
         else:
             self._state = "idle"
+        # The pool is joined above: chained drivers may start the next run.
+        if cb.on_run_closed is not None:
+            try:
+                cb.on_run_closed()
+            except Exception:
+                logger.warning("on_run_closed callback failed", exc_info=True)
 
     def _module_label(self, iid: str) -> str:
         """Return a readable instance label using the module short name."""
@@ -372,6 +488,41 @@ class PipelineController:
             for node_id in list(self._node_task_total):
                 if node_id not in self._node_failed:
                     cb.on_node_status(node_id, "error")
+
+    def _record_run_abort(self, exc: BaseException) -> str:
+        """Record an escaping run exception as node failures (F0).
+
+        Per-task failures persist through the batch epilogue, but an
+        exception escaping ``_run_batch`` (or the batch loop) skips it:
+        without this, the session stays ``"running"`` on disk with no
+        reason. Pending nodes fail with ``run aborted: ...`` and the
+        state/meta/results files persist best-effort. Returns the reason.
+        """
+        reason = _failure_reason(exc)
+        if not hasattr(self, "_node_failed"):
+            self._node_failed = set()
+        if not hasattr(self, "_node_failures"):
+            self._node_failures = {}
+        for iid in list(getattr(self, "_node_task_total", {}) or {}):
+            if iid not in self._node_failed:
+                self._node_failed.add(iid)
+                self._node_failures.setdefault(
+                    iid, f"run aborted: {reason}")
+        if not hasattr(self, "_session_state") or not isinstance(
+            self._session_state, dict
+        ):
+            self._session_state = {}
+        try:
+            self._session_state["failed_nodes"] = sorted(self._node_failed)
+            self._session_state["failure_reasons"] = dict(
+                self._node_failures)
+            self._session_state["pipeline_status"] = "failed"
+            self._save_session_state()
+            self._update_session_meta("failed")
+            self._write_results([])
+        except Exception:
+            logger.warning("Abort record persistence failed", exc_info=True)
+        return reason
 
     # ------------------------------------------------------------------
     # Session management.
@@ -1012,6 +1163,8 @@ class PipelineController:
                 ),
                 "output": node_outputs.get(iid),
             }
+            if iid in getattr(self, "_node_failures", {}):
+                nodes[iid]["error"] = self._node_failures[iid]
             if (
                 nodes[iid]["output"] is not None
                 and not nodes[iid]["files"]
@@ -1070,14 +1223,24 @@ class PipelineController:
         """Persist per-tile results ledger (work actually executed).
 
         Skipped tile tasks (effectively reused roles) are omitted by
-        design; reuse is counted in session state and the QA report.
+        design; reuse is counted in session state and the QA report. One
+        entry per failed instance (``{"iid", "node", "error"}``, no
+        ``tile_id``) closes the ledger so barrier failures — absent from
+        the tile stream — survive on disk with their reason.
         """
         if not self._session_dir:
             return
+        ledger = list(tile_results or [])
+        for iid in sorted(getattr(self, "_node_failures", {}) or ()):
+            ledger.append({
+                "iid": iid,
+                "node": (self._modules or {}).get(iid, iid),
+                "error": self._node_failures[iid],
+            })
         output_path = self._session_dir / "results.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
-            json.dumps(tile_results, indent=2), encoding="utf-8"
+            json.dumps(ledger, indent=2), encoding="utf-8"
         )
 
     def _save_run_metrics(self, metrics: dict) -> None:
@@ -1122,9 +1285,11 @@ class PipelineController:
             return
         session_dir = Path(session_dir)
         targets = [session_dir]
-        lotes = session_dir / "lotes"
-        if lotes.is_dir():
-            targets.extend(sorted(p for p in lotes.iterdir() if p.is_dir()))
+        for sub in ("lotes", "final"):
+            subdir = session_dir / sub
+            if subdir.is_dir():
+                targets.extend(
+                    sorted(p for p in subdir.iterdir() if p.is_dir()))
         for target in targets:
             try:
                 self._sweep_session(target)
@@ -1228,7 +1393,40 @@ class PipelineController:
         except Exception:
             meta = {}
         meta["pipeline_status"] = status
+        if getattr(self, "_node_failures", None):
+            meta["failure_reasons"] = dict(self._node_failures)
         meta_file.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+
+    def _stash_tiling_telemetry(self, session_dir: Path) -> None:
+        """Copy each source's leg file next to the session (auto record).
+
+        The tiler streams ``tiling_telemetry.jsonl`` legs into its output
+        dir during the pass; the tile cache (or a cancelled run's temp dir)
+        is the wrong place to go looking for them afterwards. Best-effort:
+        a missing leg file simply means that source served from cache.
+        """
+        tilings = getattr(self, "_tilings", None) or {}
+        if not tilings or not session_dir:
+            return
+        multi = len(tilings) > 1
+        for iid, tiling in tilings.items():
+            try:
+                src = (
+                    Path(getattr(tiling, "output_dir", "")) /
+                    "tiling_telemetry.jsonl"
+                )
+            except Exception:
+                continue
+            name = (
+                f"tiling_telemetry_{iid}.jsonl"
+                if multi
+                else "tiling_telemetry.jsonl"
+            )
+            try:
+                if src.is_file():
+                    shutil.copy2(src, Path(session_dir) / name)
+            except OSError:
+                continue
 
     # ------------------------------------------------------------------
     # Full run
@@ -1245,6 +1443,7 @@ class PipelineController:
         max_workers: int | None = None,
         memory_budget_bytes: int | None = None,
         keep_intermediates: bool = False,
+        file_overrides: dict[str, str] | None = None,
     ) -> None:
         try:
             self._tiles_seen = 0
@@ -1277,6 +1476,30 @@ class PipelineController:
                     if _loader_iids
                     else {}
                 )
+
+            # Per-run file overrides (file queues): one file-backed instance
+            # uses a different file for THIS run only. Applied on copies so
+            # the caller's mappings stay untouched; the overridden file then
+            # flows through the normal gates, tiling and fingerprint seeds.
+            overrides = dict(file_overrides or {})
+            if overrides:
+                source_paths = dict(source_paths or {})
+                configs = {
+                    iid: dict(cfg) for iid, cfg in (configs or {}).items()
+                }
+                for iid, path in overrides.items():
+                    if iid not in iids:
+                        continue
+                    caps = self._node_caps(iid, configs)
+                    if caps.get("triggers_tiling"):
+                        source_paths[iid] = path
+                    else:
+                        fkey = caps.get("input_file_key")
+                        if not fkey:
+                            continue
+                        cfg = dict(configs.get(iid, {}))
+                        cfg[fkey] = path
+                        configs[iid] = cfg
 
             # Product inputs contribute external files as seeds. Store a
             # size+mtime fingerprint so reuse detects content changes even when
@@ -1358,8 +1581,11 @@ class PipelineController:
 
                 # Progress is reported per read chunk (millions of messages on
                 # a billion-point source); throttle it to integer-% changes so
-                # the GUI is not flooded with layout work.
+                # the GUI is not flooded with layout work. The rate rides
+                # along (refreshed on a trailing window) so a mid-file
+                # collapse is visible live instead of via a frozen percent.
                 last_tiling_pct: dict[str, int] = {}
+                tiling_rate_state: dict[str, list] = {}
                 for iid in tiling_triggers:
                     if cb.on_node_status:
                         cb.on_node_status(iid, "processing")
@@ -1404,6 +1630,9 @@ class PipelineController:
                             cb.on_node_status(iid, "error")
                         if cb.on_message:
                             cb.on_message("No source file set for LiDAR input", "error")
+                        if cb.on_finished:
+                            cb.on_finished({}, [], 0, [],
+                                           {"blocked_by_source": True})
                         return
 
                     # Tile data is shared between sessions while the source
@@ -1417,9 +1646,21 @@ class PipelineController:
                     )
                     def tiling_progress(p: int, t: int) -> None:
                         pct = int(p / t * 100) if t else 0
-                        if last_tiling_pct.get(iid) != pct:
+                        now = time.monotonic()
+                        st = tiling_rate_state.get(iid)
+                        if st is None:
+                            st = tiling_rate_state[iid] = [now, p, 0.0]
+                        rate = (p - st[1]) / max(now - st[0], 1e-9) / 1e6
+                        if (
+                            last_tiling_pct.get(iid) != pct
+                            or (now - st[2]) >= 30.0
+                        ):
                             last_tiling_pct[iid] = pct
-                            cb.on_message(f"Tiling... {pct}%", "info")
+                            st[2] = now
+                            cb.on_message(
+                                _tiling_message(p, t, rate), "info")
+                        if (now - st[0]) >= 60.0:
+                            st[0], st[1] = now, p
 
                     tiler = LiDARTiler(
                         source_path,
@@ -1428,6 +1669,9 @@ class PipelineController:
                         buffer_m=float(tiling_plan.get(iid, {}).get("buffer_m") or 10.0),
                         max_points_per_tile=int(
                             tiling_plan.get(iid, {}).get("max_points_per_tile") or 0
+                        ),
+                        merge_sparse_below=int(
+                            tiling_plan.get(iid, {}).get("merge_sparse_below") or 0
                         ),
                         output_format=intermediate_fmt,
                         memory_budget_bytes=self._run_memory_budget_bytes,
@@ -1459,6 +1703,9 @@ class PipelineController:
                                 f"No tiles generated — check the source file ({Path(source_path).name})",
                                 "error",
                             )
+                        if cb.on_finished:
+                            cb.on_finished({}, [], 0, [],
+                                           {"blocked_by_tiles": True})
                         return
                     if cb.on_node_status:
                         cb.on_node_status(iid, "done")
@@ -1547,6 +1794,10 @@ class PipelineController:
             session_dir = self._new_session_dir(session_root)
             session_dir.mkdir(parents=True, exist_ok=True)
             self._run_main_session_dir = session_dir
+            # Auto-record: tiling leg files land next to the session even
+            # though tiling ran earlier (and into a temp dir when
+            # intermediates are off).
+            self._stash_tiling_telemetry(session_dir)
 
             # Run context shared with every batch mini-session.
             self._run_source_fps = source_fps
@@ -1588,6 +1839,31 @@ class PipelineController:
             cancelled = False
             segment_output_payloads: list[dict] = []
             batch_verdicts: list = []
+            # Run-scoped failure map ({iid: reason}); the per-batch dict is
+            # reset on every batch, so the report accumulator merges them.
+            run_failed_nodes: dict = {}
+
+            # Independent segments: drop Consolidate instances (warned, by
+            # name) and rewire their consumers to the providers, so every
+            # batch runs the full subgraph and per-segment products stay
+            # separate with no final merge. Deferred computation below then
+            # naturally empties (no consolidators left).
+            if not self._resolve_merge_segments(configs, tiling_triggers):
+                skipped = {
+                    iid for iid in iids
+                    if self._node_caps(iid, configs).get("consolidator")
+                }
+                if skipped:
+                    if cb.on_message:
+                        names = sorted(
+                            self._node_display_name(i) for i in skipped)
+                        cb.on_message(
+                            "Independent segments: skipping Consolidate "
+                            f"node(s) {', '.join(names)}; segment products "
+                            "stay separate with no final merge.",
+                            "warning",
+                        )
+                    iids, edges = prune_nodes(iids, edges, skipped)
 
             # Consolidators merge every segment's provider product, so neither
             # they nor anything reachable from them can run inside a segment:
@@ -1653,6 +1929,8 @@ class PipelineController:
                         batch_dir, batch_tiles, batch_index, len(batches),
                     )
                 )
+                run_failed_nodes.update(
+                    getattr(self, "_node_failures", {}) or {})
                 batch_verdicts.append(
                     getattr(self, "_last_batch_verdict", None)
                 )
@@ -1702,6 +1980,8 @@ class PipelineController:
                         providers_by_port=providers_by_port,
                     )
                 )
+                run_failed_nodes.update(
+                    getattr(self, "_node_failures", {}) or {})
                 failed += final_failed
                 batch_verdicts.append(
                     getattr(self, "_last_batch_verdict", None)
@@ -1719,6 +1999,20 @@ class PipelineController:
             # must NOT show a fake "Consolidated" block built from the last
             # segment batch (on_pipeline_finished already publishes the flat
             # products for non-segmented runs).
+
+            if (
+                not cancelled
+                and failed == 0
+                and segments is not None
+                and len(segments) > 1
+                and not self._resolve_merge_segments(configs, tiling_triggers)
+            ):
+                # Independent segments: per-segment mosaics stay separate, so
+                # offer one virtual mosaic (VRT, no copied bytes) per product.
+                self._build_segment_vrts(
+                    session_dir, segments, segment_output_payloads, outputs,
+                    configs, cb,
+                )
 
             if segments is not None:
                 # Aggregate parent session_meta.json summarizing the batches.
@@ -1758,6 +2052,13 @@ class PipelineController:
                     tiles, run_metrics, cancelled, failed,
                 )
 
+            if run_metrics:
+                # The end-of-run report is run-scoped: failures summed over
+                # every batch (last-write per iid) and the parent session
+                # folder, never the last mini-session's (item 44).
+                run_metrics["failed_nodes"] = dict(run_failed_nodes)
+                run_metrics["session_dir"] = str(session_dir)
+
             if not cancelled:
                 if cb.on_finished:
                     cb.on_finished(
@@ -1776,9 +2077,12 @@ class PipelineController:
                         seg_text = (
                             f" in {len(batches)} segments" if segments else ""
                         )
+                        empty_text = ""
+                        if tiling and getattr(tiling, "tiles_skipped_empty", 0):
+                            empty_text = f" — {tiling.tiles_skipped_empty} empty cells skipped"
                         cb.on_message(
                             f"Pipeline finished — {len(tiles)} tiles processed "
-                            f"({failed} with errors){seg_text}",
+                            f"({failed} with errors){seg_text}{empty_text}",
                             "success" if failed == 0 else "error",
                         )
                     else:
@@ -1789,8 +2093,9 @@ class PipelineController:
 
         except Exception as exc:
             logger.error("Pipeline failed: %s", exc)
+            reason = self._record_run_abort(exc)
             if cb.on_message:
-                cb.on_message(f"Pipeline error: {exc}", "error")
+                cb.on_message(f"Pipeline error: {reason}", "error")
             self._fail_all(cb)
         finally:
             self._sweep_intermediates()
@@ -1818,6 +2123,36 @@ class PipelineController:
                 }
             cleaned[iid] = payload
         return cleaned
+
+    def _export_filenames(
+        self, order: list[str], configs: dict | None
+    ) -> dict[str, str]:
+        """Deterministic flat export names for finals-only sessions.
+
+        The first export in topological order keeps the clean basename;
+        later ones take _2, _3... Deterministic per graph (no runtime
+        races between parallel barriers). Only consulted when the run
+        drops intermediates; with intermediates kept the legacy nested
+        layout applies.
+        """
+        names: dict[str, str] = {}
+        pos = 0
+        for iid in order:
+            try:
+                caps = effective_node_caps(
+                    self._modules.get(iid, iid), (configs or {}).get(iid)
+                )
+            except Exception:
+                continue
+            if not caps.get("point_cloud_export"):
+                continue
+            pos += 1
+            names[iid] = (
+                "point_cloud_consolidated.laz"
+                if pos == 1
+                else f"point_cloud_consolidated_{pos}.laz"
+            )
+        return names
 
     def _run_batch(
         self,
@@ -2014,7 +2349,7 @@ class PipelineController:
             else default_memory_budget_bytes()
         )
         worker_count = max(
-            1, int(self._run_max_workers or os.cpu_count() or 4)
+            1, int(self._run_max_workers or default_workers())
         )
         ctx["_raster_grid_memory_budget_bytes"] = max(
             1, configured_memory // worker_count
@@ -2022,6 +2357,10 @@ class PipelineController:
         ctx["provenance"] = getattr(self, "_prov_blueprint", None) or {}
         ctx["node_fps"] = fps
         ctx["intermediate_ext"] = getattr(self, "_run_intermediate_ext", "laz")
+        if not getattr(self, "_run_keep_intermediates", True):
+            # Finals-only: preassigned flat export names (deterministic per
+            # graph); the export node writes them at the artifacts root.
+            ctx["export_filenames"] = self._export_filenames(order, configs)
         if segment_outputs is not None:
             # Consolidators read their provider's product from every segment
             # through these injection keys (their provider edges are trimmed
@@ -2039,8 +2378,11 @@ class PipelineController:
             session_dir, iids, outputs, tile_results, failed, tiles,
             run_metrics, configs,
         )
-        # Persist which node versions and products this batch used.
-        if self._session_state.get("pipeline_status") == "completed":
+        # Persist which node versions and products this batch used, even on
+        # failure/cancel: without provenance the sweep skips the session
+        # entirely and finals-only runs keep every intermediate. Reuse stays
+        # gated by the session status, so failed sessions never feed it.
+        try:
             self._save_provenance(
                 session_dir,
                 run_source_fps,
@@ -2051,6 +2393,8 @@ class PipelineController:
                 getattr(self, "_last_outputs", None),
                 configs,
             )
+        except Exception as exc:
+            logger.warning("Provenance skipped for %s: %s", session_dir, exc)
         return outputs, tile_results, failed, tiles, run_metrics
 
     def _reject_ghost_products(
@@ -2518,6 +2862,33 @@ class PipelineController:
         ).get("config_schema", {})
         return int(schema.get("max_points_per_part", {}).get("default", 0))
 
+    def _resolve_merge_segments(
+        self, configs: dict | None, tiling_triggers: list
+    ) -> bool:
+        """Whether segment batches merge into one final product.
+
+        Lives in the loader's Segmentation group (default True = classic
+        consolidate-final behavior). False runs every batch as a standalone
+        pipeline and skips Consolidate instances with a warning. Unset
+        config falls back to the schema default so fresh loaders behave
+        like before. Any loader opting out disables the merge.
+        """
+        flags = []
+        for lid in tiling_triggers or {}:
+            cfg = configs.get(lid, {}) if configs else {}
+            if "merge_segments" in cfg:
+                flags.append(bool(cfg["merge_segments"]))
+                continue
+            schema = discover_node_capabilities(
+                self._modules.get(lid, lid)
+            ).get("config_schema", {})
+            flags.append(True)
+            for group in schema.get("groups", ()):
+                for param in group.get("params", ()):
+                    if param.get("key") == "merge_segments":
+                        flags[-1] = bool(param.get("default", True))
+        return all(flags) if flags else True
+
     def _build_batches(self, tiles: list[dict], max_points_per_part=0) -> list[list[dict]]:
         """Group tiles into sequential batches not exceeding ``max_points_per_part``.
 
@@ -2587,6 +2958,97 @@ class PipelineController:
         """Stable per-batch fingerprint scope (index + exact tile content)."""
         tile_ids = "\n".join(sorted(t["tile_id"] for t in batch_tiles))
         return f"seg{batch_index:04d}:{hashlib.sha1(tile_ids.encode()).hexdigest()[:12]}"
+
+    def _build_segment_vrts(
+        self, session_dir: Path, segments: list, segment_output_payloads: list,
+        outputs: dict, configs: dict, cb,
+    ) -> None:
+        """Write one mosaic VRT per per-segment barrier raster.
+
+        Independent segments (``merge_segments`` off) leave per-segment
+        mosaics with no single view: a ``final/`` VRT mosaics each product
+        without duplicating a byte. Heterogeneous groups are skipped with a
+        warning (the segments stay separate, which is the point of the
+        mode). VRT paths attach to their producer payloads so the gallery,
+        QML sidecars and ``session_state.json`` treat them like any product;
+        they never enter provenance bundles (rebuilt every run, ms cost).
+        """
+        from lynceus.processing import qml_style
+        from lynceus.processing.raster import build_vrt_mosaic
+
+        seg_dirs = [
+            session_dir / "lotes" / f"segment_{k:04d}"
+            for k in range(len(segments))
+        ]
+        barrier_iids = set()
+        for iid in self._modules:
+            try:
+                caps = self._node_caps(iid, configs)
+            except Exception:
+                continue
+            if caps.get("barrier_task") or caps.get("consolidate_task"):
+                # Tile+barrier instances qualify too (Generate DTM/DSM):
+                # their per-segment payload carries the barrier mosaic, and
+                # skipping them silently left those products without a VRT.
+                barrier_iids.add(iid)
+        groups = _segment_raster_groups(
+            segment_output_payloads, seg_dirs, barrier_iids)
+        if not groups:
+            return
+        final_dir = session_dir / "final"
+        counters: dict[str, int] = {}
+        for rel, members in groups.items():
+            producers = sorted({iid for iid, _ in members})
+            producer = producers[0]
+            out = final_dir / Path(rel).parent / (Path(rel).stem + ".vrt")
+            try:
+                res = build_vrt_mosaic([p for _, p in members], out)
+            except Exception as exc:
+                res = {"skipped": str(exc)}
+            if "skipped" in res:
+                if cb.on_message:
+                    cb.on_message(
+                        f"Independent segments: no VRT for {rel} "
+                        f"({res['skipped']}); segment products stay separate.",
+                        "warning",
+                    )
+                continue
+            try:
+                out.with_suffix(".meta.json").write_text(
+                    json.dumps(
+                        {
+                            "vrt_sources": [
+                                Path(p).relative_to(session_dir).as_posix()
+                                for _, p in members
+                            ],
+                            "generator": "lynceus independent-segments VRT",
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except (OSError, ValueError):
+                pass
+            src_qmls = [
+                str(Path(p).with_suffix(".qml"))
+                for _, p in members
+                if Path(p).with_suffix(".qml").is_file()
+            ]
+            qml_style.generate_vrt_qml(str(out), src_qmls)
+            slot = counters.get(producer, 0)
+            counters[producer] = slot + 1
+            key = "vrt_mosaic" if slot == 0 else f"vrt_mosaic_{slot + 1}"
+            payload = outputs.get(producer)
+            if not isinstance(payload, dict):
+                payload = {}
+                outputs[producer] = payload
+            payload[key] = str(out)
+            if cb.on_message:
+                cb.on_message(
+                    f"Independent segments: virtual mosaic {out.name} "
+                    f"over {len(members)} segment product(s).",
+                    "info",
+                )
 
     def _resolve_input_crs(self, configs: dict, iids: list[str]) -> str:
         """Resolve CRS for a barrier-only run from the first raster input.
@@ -2821,6 +3283,9 @@ class PipelineController:
             progress_callback=self._make_dag_progress(cb),
             cancel_flag=lambda: self._cancel.is_set(),
             pause_flag=lambda: not self._pause.is_set(),
+            memory_budget_bytes=self._run_memory_budget_bytes,
+            on_task_start=self._make_barrier_start(cb),
+            on_barrier_done=self._make_barrier_done(cb),
         )
 
         self._emit_warnings(cb, outputs, tile_results)
@@ -2830,6 +3295,9 @@ class PipelineController:
             **exec_stats,
             "start_iso": self._run_start_iso,
             "end_iso": run_end_iso,
+            "session_dir": str(self._session_dir)
+            if self._session_dir is not None
+            else "",
         }
         self.last_metrics = run_metrics
         self._save_run_metrics(run_metrics)
@@ -2842,6 +3310,8 @@ class PipelineController:
             # _cleanup emits the final cancellation message.
             self._session_state["pipeline_status"] = "cancelled"
             self._session_state["failed_nodes"] = sorted(self._node_failed)
+            self._session_state["failure_reasons"] = dict(
+                getattr(self, "_node_failures", {}) or {})
             self._save_session_state()
             self._update_session_meta("cancelled")
             if cb.on_node_status:
@@ -2855,6 +3325,8 @@ class PipelineController:
             self._session_state.setdefault("node_outputs", {})[iid] = out
             self._session_state.setdefault("completed_nodes", []).append(iid)
         self._session_state["failed_nodes"] = sorted(self._node_failed)
+        self._session_state["failure_reasons"] = dict(
+            getattr(self, "_node_failures", {}) or {})
         self._session_state["pipeline_status"] = (
             "completed" if failed == 0 else "failed"
         )
@@ -2901,6 +3373,55 @@ class PipelineController:
         self._node_task_done = {}
         self._stage_done = {}
         self._node_failed = set()
+        # Run-scoped failure reasons ({iid: first line}): UI notices plus the
+        # on-disk record (provenance/session_meta/results). Last reason wins
+        # per iid across segment batches.
+        self._node_failures = {}
+
+    def _oom_hint(self, task) -> str:
+        """Actionable suffix for out-of-memory task failures (EN, engine)."""
+        try:
+            import psutil
+
+            total = psutil.virtual_memory().total
+        except Exception:
+            return ""
+        try:
+            est_mb = _task_est_bytes(task) / (1024 * 1024)
+        except Exception:
+            est_mb = 0.0
+        budget_mb = _predictive_budget(total, self._run_memory_budget_bytes)
+        budget_mb = budget_mb / (1024 * 1024)
+        return (
+            f" (est. working set {est_mb:.0f} MB vs {budget_mb:.0f} MB "
+            "dispatch budget; run fewer products at once, lower the worker "
+            "count, or raise the memory limit in Preferences > Performance)"
+        )
+
+    def _make_barrier_start(self, cb: PipelineCallbacks):
+        """Announce barrier dispatches (phase indicator, not per-tile spam)."""
+
+        def started(task) -> None:
+            if getattr(task, "kind", None) != "barrier":
+                return
+            if cb.on_barrier_started:
+                cb.on_barrier_started(task.iid)
+            if cb.on_message:
+                cb.on_message(
+                    f"Merging {self._module_label(task.iid)}...", "info"
+                )
+
+        return started
+
+    @staticmethod
+    def _make_barrier_done(cb: PipelineCallbacks):
+        """Publish each barrier payload at completion (incremental gallery)."""
+
+        def done(task, result: dict) -> None:
+            if cb.on_barrier_outputs:
+                cb.on_barrier_outputs(task.iid, result)
+
+        return done
 
     def _make_dag_progress(self, cb: PipelineCallbacks):
         def progress(done: int, total: int, task, ok: bool, exc=None) -> None:
@@ -2922,19 +3443,23 @@ class PipelineController:
                 self._node_failed.add(iid)
                 if cb.on_node_status:
                     cb.on_node_status(iid, "error")
-                if exc is not None and cb.on_message:
+                if exc is not None:
                     # The failure reason used to die in the worker log: the
                     # UI showed red with no cause. Real failures (not
                     # dependency cascades, which carry no exception) report
-                    # their reason as a persistent error notice.
-                    reason = str(exc).strip().splitlines()
-                    reason = reason[0] if reason else "unknown error"
-                    if len(reason) > 400:
-                        reason = reason[:400] + "…"
-                    cb.on_message(
-                        f"{self._node_display_name(iid)} failed: {reason}",
-                        "error",
-                    )
+                    # their reason as a persistent error notice and keep it
+                    # for the on-disk record.
+                    reason = _failure_reason(exc)
+                    if isinstance(exc, MemoryError):
+                        reason += self._oom_hint(task)
+                    self._node_failures[iid] = reason
+                    if cb.on_message:
+                        cb.on_message(
+                            f"{self._node_display_name(iid)} failed: {reason}",
+                            "error",
+                        )
+                else:
+                    self._node_failures[iid] = "blocked by failed dependency"
             if task.kind == "tile":
                 self._stage_done[iid] = self._stage_done.get(iid, 0) + 1
                 if cb.on_message:
@@ -2946,7 +3471,7 @@ class PipelineController:
                         )
                     cb.on_message("  |  ".join(parts), "info")
             elif cb.on_message:
-                cb.on_message(f"Merging {self._module_label(iid)}...", "info")
+                cb.on_message(f"Merged {self._module_label(iid)}", "info")
 
             if cb.on_progress:
                 cb.on_progress(done, total)

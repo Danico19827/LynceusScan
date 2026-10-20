@@ -99,6 +99,12 @@ def discover_node_capabilities(node_id: str) -> dict:
 
     result["triggers_tiling"] = specs.get("triggers_tiling", False)
     result["consolidator"] = specs.get("consolidator", False)
+    result["memory_factor"] = _memory_factor(specs)
+    result["tile_weight_factor"] = _tile_weight_factor(specs)
+    result["merge_copies"] = _merge_copies(specs)
+    result["merge_cell_bytes"] = _merge_cell_bytes(specs)
+    result["grid_bytes_per_cell"] = _grid_bytes_per_cell(specs)
+    result["grid_resolution_keys"] = tuple(specs.get("grid_resolution_keys") or ())
     result["provides"] = specs.get("provides", {})
     result["requires"] = specs.get("requires", {})
     result["passes_flags"] = tuple(specs.get("passes_flags") or ())
@@ -108,6 +114,7 @@ def discover_node_capabilities(node_id: str) -> dict:
     result["table_output_file"] = specs.get("table_output_file", "")
     result["output_files"] = specs.get("output_files", {})
     result["output_globs"] = specs.get("output_globs", ())
+    result["input_globs"] = tuple(specs.get("input_globs") or ())
     result["output_port"] = specs.get("output_port", "")
     result["point_cloud_export"] = specs.get("point_cloud_export", False)
     result["config_schema"] = specs.get("config_schema", {})
@@ -116,6 +123,34 @@ def discover_node_capabilities(node_id: str) -> dict:
 
     _CAPABILITY_CACHE[node_id] = result
     return result
+
+
+def _forward_bounded_notes(result, ctx) -> object:
+    """Append a barrier's bounded-mode notes to its warnings (one place).
+
+    Writers record notices in ``ctx["_bounded_notes"]``; this drains them
+    into the payload the engine already forwards to the UI. Dict payloads
+    only; anything else passes through untouched.
+    """
+    try:
+        notes = ctx.pop("_bounded_notes", [])
+    except AttributeError:
+        return result
+    if not notes or not isinstance(result, dict):
+        return result
+    seen = set()
+    merged = []
+    for text in list(result.get("warnings", []) or []) + list(notes):
+        if isinstance(text, str) and text not in seen:
+            seen.add(text)
+            merged.append(text)
+    result["warnings"] = merged
+    return result
+
+
+def _run_barrier_task(fn, ctx):
+    """Spawn-safe barrier wrapper: runs the node fn, forwards notes."""
+    return _forward_bounded_notes(fn(ctx), ctx)
 
 
 def _task_exec(module_id: str, fn: Callable, args: tuple):
@@ -150,6 +185,7 @@ def _resolve_spec_overlay(module, base: dict) -> dict:
     for key in (
         "triggers_tiling",
         "consolidator",
+        "memory_factor",
         "provides",
         "requires",
         "passes_flags",
@@ -159,6 +195,11 @@ def _resolve_spec_overlay(module, base: dict) -> dict:
         "table_output_file",
         "output_files",
         "output_globs",
+        "input_globs",
+        "grid_bytes_per_cell",
+        "grid_resolution_keys",
+        "merge_copies",
+        "merge_cell_bytes",
         "output_port",
         "point_cloud_export",
         "qml",
@@ -241,6 +282,106 @@ class Task:
     deps: set[str] = field(default_factory=set)
     tile_id: str | None = None
     weight: int = 0  # Tile point count: queue priority and RAM estimate.
+    # Barrier working-set multiplier over on-disk input bytes (0 = default).
+    # Read from the module PROCESSING_SPECS at build time; the executor
+    # multiplies it by the input files already materialized in the task ctx.
+    mem_factor: float = 0.0
+    # Direct-mode working set in cell copies (0.0 = legacy input-bytes
+    # estimate). With merge_cell_bytes it models the peak the writer WILL
+    # hold: union cells × cell bytes × copies when the full fit goes
+    # direct, window peak when it streams. Declared per merge barrier.
+    merge_copies: float = 0.0
+    # Cell bytes for the merge model (0 = 4, float32 mosaic cells; 8 for
+    # float64 DEM operators).
+    merge_cell_bytes: int = 0
+    # Barrier input globs resolved against the task artifacts root at
+    # dispatch (the other half of the output_globs reuse contract): tile
+    # fragments the barrier merges. Optional; unset keeps the *_path-only
+    # estimate (engine behavior unchanged for third-party nodes).
+    input_globs: tuple = ()
+    # Tile RAM multiplier over the per-point estimate. Read from the module
+    # PROCESSING_SPECS at build time (0.0 = 1.0); admission control uses the
+    # product weight × bytes-per-point × tile_f, while queue priority keeps
+    # the raw point count so heavy nodes do not starve light neighbors.
+    tile_f: float = 0.0
+    # Tile grid working set: bytes per grid cell (0.0 = point model only).
+    # Grid-building nodes scale with tile AREA, not points (a sparse
+    # 2.6 km supertile holds a 683 MB PMF grid for 116k points); the
+    # executor adds cells × grid_bpc with cells from the tile core bounds
+    # at grid_res_m. Read from PROCESSING_SPECS at build time.
+    grid_bpc: float = 0.0
+    # Grid resolution in meters, resolved at build time from the node's
+    # grid_resolution_keys against its config (0.0 = no grid term).
+    grid_res_m: float = 0.0
+
+
+def _memory_factor(specs: dict) -> float:
+    """Working-set multiplier declared by a node (0.0 = engine default)."""
+    try:
+        factor = float(specs.get("memory_factor") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return factor if factor > 0.0 else 0.0
+
+
+def _tile_weight_factor(specs: dict) -> float:
+    """Per-point RAM multiplier declared by a node (0.0 = 1.0 engine default)."""
+    try:
+        factor = float(specs.get("tile_weight_factor") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return factor if factor > 0.0 else 0.0
+
+
+def _merge_copies(specs: dict) -> float:
+    """Direct-mode cell copies declared by a merge barrier (0.0 = legacy)."""
+    try:
+        copies = float(specs.get("merge_copies") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return copies if copies > 0.0 else 0.0
+
+
+def _merge_cell_bytes(specs: dict) -> int:
+    """Cell bytes for the merge model (0 = float32 default)."""
+    try:
+        cell = int(specs.get("merge_cell_bytes") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return cell if cell > 0 else 0
+
+
+def _grid_bytes_per_cell(specs: dict) -> float:
+    """Grid working-set bytes per cell declared by a node (0.0 = none)."""
+    try:
+        value = float(specs.get("grid_bytes_per_cell") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0.0 else 0.0
+
+
+def _grid_resolution(task_ctx: dict, specs: dict) -> float:
+    """Grid resolution in meters from the node's declared ctx keys.
+
+    Grid-building nodes read their cell size under different config keys
+    (``resolution`` for surfaces, ``<method>_cell_size`` for ground
+    filters); the node declares the candidates once via
+    ``grid_resolution_keys`` and the first positive value in its resolved
+    ctx wins. 0.0 disables the grid term (point model only).
+    """
+    keys = specs.get("grid_resolution_keys") or ("resolution", "cell_size")
+    try:
+        candidates = list(keys)
+    except TypeError:
+        return 0.0
+    for key in candidates:
+        try:
+            value = float(task_ctx.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0.0:
+            return value
+    return 0.0
 
 
 def compile_pipeline(nodes, edges) -> list[str]:
@@ -367,6 +508,58 @@ def build_ctx(
         "meta": source_meta or {},
         "acceleration": acceleration or {"device": "cpu", "backend": "none", "available": False},
     }
+
+
+def prune_nodes(iids: list, edges: list, skipped: set) -> tuple[list, list]:
+    """Drop skipped nodes, rewiring their consumers to kept providers.
+
+    For every removed edge ``s -> d`` with ``d`` skipped, consumers of ``d``
+    inherit ``d``'s own providers (transitively: chains of skipped nodes
+    resolve to kept ancestors). Edges into removed consumers vanish;
+    exact-duplicate edges collapse. Order-preserving and deterministic:
+    same graph in, same graph out on any machine.
+    """
+    skipped = set(skipped or ())
+    if not skipped:
+        return list(iids), list(edges)
+    providers: dict[str, list] = {}
+    for s, d, out_t, in_t in edges:
+        if d in skipped:
+            providers.setdefault(d, []).append((s, out_t))
+    keep = [i for i in iids if i not in skipped]
+
+    def _resolve(sid: str, out_t, seen: set) -> list:
+        """Kept providers of ``sid`` as ``[(iid, out_type)]``, transitively.
+
+        Cycles (rejected later by the topological compiler) terminate via
+        ``seen`` instead of recursing forever.
+        """
+        if sid not in skipped:
+            return [(sid, out_t)]
+        if sid in seen:
+            return []
+        seen = seen | {sid}
+        resolved: list = []
+        for ps, pout in providers.get(sid, []):
+            resolved.extend(_resolve(ps, pout, seen))
+        return resolved
+
+    new_edges: list = []
+    for s, d, out_t, in_t in edges:
+        if d in skipped:
+            continue
+        if s in skipped:
+            for ks, kout in _resolve(s, out_t, set()):
+                new_edges.append((ks, d, kout, in_t))
+        else:
+            new_edges.append((s, d, out_t, in_t))
+    seen: set = set()
+    deduped: list = []
+    for edge in new_edges:
+        if edge not in seen:
+            seen.add(edge)
+            deduped.append(edge)
+    return keep, deduped
 
 
 def _task_ctx(
@@ -621,6 +814,9 @@ def build_dag(
             tasks[task_id] = Task(
                 task_id, iid, module_id, "tile", exec_fn, exec_args,
                 deps, tile_id, tile.get("point_count", 0),
+                tile_f=caps.get("tile_weight_factor", 0.0),
+                grid_bpc=_grid_bytes_per_cell(caps),
+                grid_res_m=_grid_resolution(task_ctx, caps),
             )
             if produces_mosaic:
                 mosaic_deps.setdefault(module_id, set()).add(task_id)
@@ -709,8 +905,16 @@ def build_dag(
             task_ctx["_point_cloud_sources"] = point_cloud_sources
 
         exec_fn, exec_args = _task_exec(module_id, barrier_fn, (task_ctx,))
+        if exec_fn is barrier_fn:
+            # Core barrier: same-process wrapper drains bounded-mode notes
+            # into the payload warnings (extensions drain in the wrapper).
+            exec_fn, exec_args = _run_barrier_task, (barrier_fn, task_ctx)
         tasks[task_id] = Task(
-            task_id, iid, module_id, "barrier", exec_fn, exec_args, deps
+            task_id, iid, module_id, "barrier", exec_fn, exec_args, deps,
+            mem_factor=caps.get("memory_factor", 0.0),
+            input_globs=tuple(caps.get("input_globs") or ()),
+            merge_copies=caps.get("merge_copies", 0.0),
+            merge_cell_bytes=caps.get("merge_cell_bytes", 0),
         )
 
     return list(tasks.values())

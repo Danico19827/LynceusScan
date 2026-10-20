@@ -29,12 +29,20 @@ RECENT_LIMIT_DEFAULT = 10
 SNAP_KEY = "snap_enabled"
 # Finals-only sessions: keep per-tile intermediates + shared tile cache.
 KEEP_INTERMEDIATES_KEY = "keep_intermediates"
-# Color theme pack id (Preferences > General); "default" is the core dark.
+# Color theme pack id (Preferences > General); "default" is the core dark. 
 THEME_KEY = "theme"
 THEME_DEFAULT = "default"
+# Main-window splitter layouts (QSplitter.saveState/restoreState blobs).
+SPLITTER_MAIN_KEY = "splitter_main"
+SPLITTER_LEFT_KEY = "splitter_left"
+SPLITTER_RIGHT_KEY = "splitter_right"
 # Interface font family (Preferences > General); "" is the system default.
 FONT_FAMILY_KEY = "font_family"
 FONT_FAMILY_DEFAULT = ""
 # Interface font size as percent (Preferences > General); 100 = theme size.
 FONT_SIZE_KEY = "font_size"
 FONT_SIZE_DEFAULT = 100
+# Pre-flight advisor: suppress the sizing dialog once the operator opts out.
+PREFLIGHT_QUIET_KEY = "preflight_advisor_disabled"
+# Configurable run output root (Preferences > General); "" = default root.
+OUTPUT_ROOT_KEY = "output_root"

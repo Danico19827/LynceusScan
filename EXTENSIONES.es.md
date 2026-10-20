@@ -353,6 +353,12 @@ Declara `"tile_task": "tile_<nombre>"` en `PROCESSING_SPECS` y lee
 entradas tile igual (paths de `ctx`). Parciales mergean en tu
 `barrier_task` o un `consolidator`.
 
+Trabajo tile pesado en memoria: el estimado de admisión asume 64 B por
+punto; declara tu working set real cuando lo excedas —
+`PROCESSING_SPECS["tile_weight_factor"]` (p. ej. 3.0 para una etapa con
+KD-tree), o `"grid_bytes_per_cell"` + `"grid_resolution_keys"` para
+grillas que escalan con el **área** del tile (ver §18).
+
 ### 5c. `config_schema` (formulario del Inspector)
 
 ```python
@@ -408,6 +414,10 @@ contra el motor:
   siempre recomputando.
 - Los sidecars viajan solo cuando un glob matchea su basename
   (`image.*` cubre `image.meta.json`; si no, lístalo explícito).
+- Los streams intermedios de nube cambian de formato por corrida (`.laz`
+  normal, `.las` en corridas muy grandes): declara los globs de stream
+  como `/**/*.laz` (el motor los remapea) y nunca fijes la extensión en
+  los paths que recibes (`ctx["intermediate_ext"]` la nombra).
 
 Qué cubre el fingerprint (para razonar sobre reuso): el string de id de
 módulo, los **bytes del archivo fuente del módulo** (editar tu `.py` —
@@ -494,6 +504,12 @@ def barrier_input_txt(ctx):
   `"multispectral"` (chequeo multibanda), `"table_gpkg"` (SQLite),
   cualquier otro (rama CSV), `"none"`/`"custom"`/`""` (sin opiniones —
   para clases de producto sin rama core).
+- Cola incluida: cualquier nodo con `input_file_key` hereda también la
+  cola de archivos compartida (Browse multi-selección + *Gestionar
+  cola...*, respaldada por `lynceus/nodes/_file_queue.py`) — los
+  archivos encolados corren desatendidos, una sesión limpia por archivo,
+  y cada corrida recibe su archivo como `ctx["file_path"]`. Nada que
+  implementar de tu lado.
 - Sin `input_file_key`, un barrier corre headless sobre
   `ctx["file_path"]` (widget genérico, sin Browse). Familias estrategia
   con file inputs conservan registro explícito de widget (edit core) —
@@ -502,7 +518,7 @@ def barrier_input_txt(ctx):
 ## 8. Familias estrategia (variantes)
 
 Para un nodo con productos/métodos conmutables (como Input Raster con
-`strategy=dtm|dsm|chm` o Classify Ground con `pmf|csf|smrf`):
+`strategy=dtm|dsm|chm` o Classify Ground con `pmf|csf|smrf|mcc|atin`):
 
 - **Base**: nodo normal con `NODE_ID`, `INPUTS = ()`, `OUTPUTS = ()`, y
   un campo `strategy` en `config_schema` (default `""`) más
@@ -728,25 +744,46 @@ Cada artefacto de arriba es escribible a mano; el CLI solo acelera:
 ## 18. Modelo de ejecución (diseña nodos pesados alrededor de esto)
 
 - **Workers, no la app**: tareas tile y barrier corren en procesos
-  worker `spawn` separados (pool al tamaño de CPU), nunca en el proceso
-  GUI. Mantén tasks autocontenidas como funciones de `(tile, ctx)` /
-  `(ctx)`: **todo lo que toquen debe ser picklable** (dicts/listas/
-  strings/números/paths-como-strings planos — sin QObjects, sin file
-  handles abiertos, sin lambdas, sin cachés mutables a nivel de módulo
-  compartidas con la UI).
-- **Envelope de memoria**: el motor throttlea despacho predictivo
-  (~70% de RAM sobre tiles en vuelo) y reactivo (muestreo RSS
-  achicando workers); el tiler pagina por bucket bajo presupuesto en
-  bytes. Diseña para eso igual: streamea archivos (nunca `read()` de un
-  raster mayor que RAM — lecturas por ventana llegan post-MVP; hoy,
-  rasters oversized fallan el nodo con error legible en vez de swapear
-  la máquina), prefiere generadores sobre listas materializadas, cierra
+  worker `spawn` separados (pool por defecto: todos los núcleos menos
+  uno, para que la GUI y el SO sigan respondiendo; conteos explícitos de
+  Preferencias/CLI se respetan), nunca en el proceso GUI. Mantén tasks
+  autocontenidas como funciones de `(tile, ctx)` / `(ctx)`: **todo lo
+  que toquen debe ser picklable** (dicts/listas/strings/números/
+  paths-como-strings planos — sin QObjects, sin file handles abiertos,
+  sin lambdas, sin cachés mutables a nivel de módulo compartidas con la
+  UI).
+- **Envelope de memoria**: el despacho se throttlea predictivo contra
+  ~70% de RAM — los tiles se estiman por puntos (64 B/punto × el
+  `tile_weight_factor` del módulo) más sus términos de grilla
+  (`grid_bytes_per_cell` × celdas a la resolución resuelta), y las
+  barreras por sus entradas en disco (× el `memory_factor` del módulo,
+  4× por defecto; derivadas numpy-pesadas declaran 10×) — y reactivo
+  (muestreo RSS achicando workers); el tiler pagina por bucket bajo
+  presupuesto en bytes. **Declara tu working set real cuando excedas los
+  defaults** (ver §5b); y diseña para el presupuesto igual: streamea
+  archivos, prefiere generadores sobre listas materializadas, cierra
   archivos explícito.
+- **Ejecución acotada (datos grandes)**: el motor no abandona en
+  silencio productos oversized — los helpers core corren por ventanas o
+  chunks según el presupuesto de memoria y son importables para tus
+  barreras: `lynceus.processing.raster` `finish_mosaic` /
+  `stack_mosaic` / `dem_mosaic` (merges + derivadas raster por ventana,
+  byte-idénticos a la vía directa, rehusando honesto con motivo legible
+  solo cuando ni por ventanas entra) y
+  `lynceus.processing.chunked_merge` `concat_csv` / `concat_gpkg` /
+  `stream_keyed_groups` (merges de tablas por append/agrupado). Los
+  avisos de modo acotado que los helpers registran en
+  `ctx["_bounded_notes"]` llegan solos al `warnings` del payload. Tu
+  propio código de merge debería seguir la misma forma: streamear,
+  chequear fit primero, fallar legible, nunca swapear la máquina.
 - **Fallas**: cualquier excepción marca el task fallido y cascadea a
-  dependientes; el mensaje llega al nodo en el canvas. `RuntimeError`
-  con mensaje plano es la convención; `MemoryError`/`KeyError`/
-  crashes nativos se comportan igual (fallido, nunca zombi) pero
-  testéalos — un segfault mata solo su worker.
+  dependientes; el mensaje llega al nodo en el canvas y el motivo queda
+  persistido en la sesión (`error` en `provenance.json`,
+  `failure_reasons` en `session_meta.json` — el informe de cierre nombra
+  cada nodo fallido con su causa). `RuntimeError` con mensaje plano es
+  la convención; `MemoryError`/`KeyError`/crashes nativos se comportan
+  igual (fallido, nunca zombi) pero testéalos — un segfault mata solo su
+  worker.
 - **Cancel/pause**: el motor pollea flags de cancel/pausa entre tasks;
   barriers largos deberían checkpointear a disco periódico para que una
   corrida cancelada retome barato en re-corrida (el reuso clavea
@@ -754,10 +791,9 @@ Cada artefacto de arriba es escribible a mano; el CLI solo acelera:
 - **Orden de discovery**: `extensions/` camina ordenado y recursivo,
   determinista — último registro gana para port ids duplicados (de ahí
   la regla de definición única §4).
-- **Política de rasters grandes (v1)**: el tiling cubre nubes de puntos;
-  barriers raster que no quepan en RAM deben fallar rápido con error
-  legible nombrando el faltante. Procesamiento por ventanas es roadmap,
-  no v1.
+- **Corridas headless**: `python -m lynceus.cli run proyecto.lynx`
+  maneja el mismo motor sin GUI (`validate` / `nodes list` incluidos) —
+  cómodo para testear por script.
 
 ## 19. Sandbox y capacidades (la política honesta)
 

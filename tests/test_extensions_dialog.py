@@ -15,7 +15,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QCheckBox, QLabel, QPushButton
 
 from lynceus.plugins.locale import locale_manager
 from lynceus.plugins.registry import manager
@@ -51,6 +51,25 @@ def _button_texts(dialog: ExtensionsDialog) -> list[str]:
         for b in dialog.findChildren(QPushButton)
         if b.text()
     ]
+
+
+def _row_checkbox(dialog: ExtensionsDialog, node_id: str) -> QCheckBox:
+    # Walk the live layout (not findChildren): rebuilds deleteLater() old
+    # rows, which outlive the call offscreen without a spinning event loop.
+    from lynceus.ui.widgets import CollapsibleSection
+
+    for idx in range(dialog._list_layout.count()):
+        section = dialog._list_layout.itemAt(idx).widget()
+        if not isinstance(section, CollapsibleSection):
+            continue
+        content = section.content_layout()
+        for row_idx in range(content.count()):
+            row = content.itemAt(row_idx).widget()
+            if row is not None and row.property("node_id") == node_id:
+                boxes = row.findChildren(QCheckBox)
+                assert len(boxes) == 1, node_id
+                return boxes[0]
+    raise AssertionError(f"checkbox for {node_id} missing from dialog")
 
 
 class ExtensionsDialogLanguageTests(unittest.TestCase):
@@ -105,10 +124,10 @@ class ExtensionsDialogLanguageTests(unittest.TestCase):
         texts = _button_texts(self._dialog)
         self.assertIn("Import extension...", texts)
         self.assertIn("Close", texts)
-        # ...and the disabled pack stays listed with an Enable action.
+        # ...and the disabled pack stays listed with an unchecked box.
         self._entry("xx")
         self._dialog._rebuild()
-        self.assertIn("Enable", _button_texts(self._dialog))
+        self.assertFalse(_row_checkbox(self._dialog, "xx").isChecked())
 
     def test_reenable_restores_language(self) -> None:
         self._dialog._toggle_enabled(self._entry("xx"))
@@ -120,6 +139,52 @@ class ExtensionsDialogLanguageTests(unittest.TestCase):
         self.assertIn("xx", locale_manager.available())
         locale_manager.set_language("xx")
         self.assertEqual(locale_manager.language, "xx")
+
+    def test_search_filters_rows_by_name_author_or_id(self) -> None:
+        box = _row_checkbox(self._dialog, "xx")
+        row = box.parent()
+        self.assertFalse(row.isHidden())
+        self._dialog._search.setText("zzz-no-such-extension")
+        self.assertTrue(row.isHidden())
+        self._dialog._search.setText("xx")
+        self.assertFalse(row.isHidden())
+        self._dialog._search.setText("LangX")
+        self.assertFalse(row.isHidden())
+
+    def test_select_extension_reveals_row(self) -> None:
+        self._dialog._search.setText("zzz-no-such-extension")
+        box = _row_checkbox(self._dialog, "xx")
+        self.assertTrue(box.parent().isHidden())
+        # select_extension clears the filter and brings the row into view.
+        self._dialog.select_extension("xx")
+        self.assertEqual(self._dialog._search.text(), "")
+        self.assertFalse(box.parent().isHidden())
+
+    def test_row_card_structure(self) -> None:
+        from lynceus.ui.widgets import CollapsibleSection
+
+        rows = []
+        for idx in range(self._dialog._list_layout.count()):
+            section = self._dialog._list_layout.itemAt(idx).widget()
+            if not isinstance(section, CollapsibleSection):
+                continue
+            content = section.content_layout()
+            for row_idx in range(content.count()):
+                row = content.itemAt(row_idx).widget()
+                if row is not None and row.property("node_id"):
+                    rows.append(row)
+        self.assertTrue(rows)
+        for row in rows:
+            with self.subTest(node=row.property("node_id")):
+                self.assertEqual(row.objectName(), "extRow")
+                dots = row.findChildren(QLabel, "statusDot")
+                self.assertEqual(len(dots), 1)
+                self.assertIn(dots[0].property("extState"),
+                              ("ok", "pending", "disabled"))
+                self.assertEqual(len(row.findChildren(QLabel, "extName")), 1)
+                self.assertEqual(len(row.findChildren(QLabel, "extDetail")), 1)
+                boxes = row.findChildren(QCheckBox)
+                self.assertEqual(len(boxes), 1)
 
 
 if __name__ == "__main__":
